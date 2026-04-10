@@ -1,0 +1,27 @@
+训练参数手册
+ep_len_mean                  rov生存时间
+ep_rew_mean                  rov平均得分
+fps                          仿真刷新频率
+explained_variance           解释方差（衡量 Critic（评价网络）预测未来收益的准确度）
+value_loss                   价值损失（Critic 网络预测分数与实际得分的均方误差）
+entropy_loss                 策略熵
+std                          动作标准差（刚开始训练时，我们需要高熵（高随机性）去探索整个水池；后期需要低熵（低随机性）去精准执行最优轨迹）
+approx_kl                    KL 散度（衡量新策略和老策略之间的差异到底有多大）
+clip_fraction                截断率（策略更新时，有多大比例的数据触发了 PPO 的限制机制）
+policy_gradient_loss         策略梯度损失（推动 Actor 网络朝着更高奖励的方向更新）
+loss                         总损失（总体呈下降趋势，包含价值损失、策略损失和熵奖励的加权和）
+learning_rate & clip_range   设置的固定超参数（学习率 0.0003，截断范围 0.2）
+
+###################################################################################
+holoocean中输出的坐标是世界坐标系，为了后续训练的模型可以部署到实机上，step后面return给神经网络的坐标必须转变为机体坐标系
+
+###################################################################################
+指令手册
+//tensorboard查看代码，必须在issacsim文件夹内执行
+
+tensorboard --logdir=./rov_tensorboard/
+
+//导入训练结果文件时，注意在地址前加r
+model = PPO.load(r"D:\new_sim\isaacsim\training_result\first\best_model.zip", env=env)
+
+
