@@ -8,15 +8,16 @@ import holoocean
 from stable_baselines3 import SAC 
 
 # ==========================================
-# 🌊 1. 3D 洋流模型 (匹配 Phase 1：纯净泳池，无洋流)
+# 🌊 1. 3D 洋流模型 (匹配 Phase 4：微弱洋流抗流测试)
 # ==========================================
 class OceanCurrentSimulator:
-    def __init__(self, num_vortices=0, map_size=25.0):
+    def __init__(self, num_vortices=4, map_size=25.0, max_current=0.35, amplitude=0.1):
         self.num_vortices = num_vortices
         self.map_size = map_size
         
-        # 🌟 调整 1：将洋流振幅降至 0.15，对齐 Edge 8 实机的抗流极限 (约 1.2 m/s)
-        self.A = 0.1
+        # 🌟 调整：接收外部传入的振幅与极速，对齐 Phase 3 训练参数
+        self.max_current = max_current
+        self.A = amplitude
         self.omega = 2 * np.pi / (12.4 * 3600) 
         self.phi_0 = 0.0 
         
@@ -26,7 +27,6 @@ class OceanCurrentSimulator:
         self.vortices = []
         self.phi_0 = np.random.uniform(0, 2 * np.pi) 
         
-        ## 生成多个涡旋，每个涡旋在水平面上有随机位置和强度，在垂直方向上有不同的衰减特性
         for _ in range(self.num_vortices):
             x0 = np.random.uniform(-self.map_size, self.map_size)
             y0 = np.random.uniform(-self.map_size, self.map_size)
@@ -64,17 +64,13 @@ class OceanCurrentSimulator:
         global_drift_x = 0.05 * time_factor * depth_ratio
         global_drift_y = 0.03 * time_factor * depth_ratio
         
-        # 1. 先计算出原始的合成流速
         raw_vx = c_fx_base * time_factor + global_drift_x
         raw_vy = c_fy_base * time_factor + global_drift_y
         
-        # 2. 🌟 绝对物理安全锁：计算水平总流速并限速
-        MAX_CURRENT = 0.20  # 设定的洋流速度绝对上限 (m/s)
+        # 2. 🌟 绝对物理安全锁：使用类的动态极速限制
         horiz_speed = np.linalg.norm([raw_vx, raw_vy])
-        
-        if horiz_speed > MAX_CURRENT:
-            # 等比例缩放，保证洋流的“方向”不变，只削弱“力度”
-            scale = MAX_CURRENT / horiz_speed
+        if horiz_speed > self.max_current:
+            scale = self.max_current / horiz_speed
             raw_vx *= scale
             raw_vy *= scale
 
@@ -127,7 +123,7 @@ class ROVFullTestWrapper(gym.Env):
         self.action_space = spaces.Box(-1.0, 1.0, (6,), np.float32)
         self.observation_space = spaces.Box(-np.inf, np.inf, (25,), np.float32) 
         self.tam_inverse = get_rov_mixing_matrix()
-        self.ocean_sim = OceanCurrentSimulator()
+        
         self.target_pos = np.zeros(3)
         self.buoyancy_bias = np.zeros(8)
         self.buoyancy_bias[4:8] = 3.0
@@ -146,7 +142,13 @@ class ROVFullTestWrapper(gym.Env):
         
         self.num_sonar_rays = len(self.sonar_ray_dirs)
         self.clean_sonar_ranges = np.ones(self.num_sonar_rays) * self.sonar_max_range
-        self.ocean_sim = OceanCurrentSimulator(num_vortices=0, map_size=25.0)
+        # 🌟 核心修改：统一且精准的 Phase 3 物理引擎注入
+        self.ocean_sim = OceanCurrentSimulator(
+            num_vortices=3,       # 3 个涡旋
+            map_size=25.0, 
+            max_current=0.1,      # 0.1 m/s 的绝对极速
+            amplitude=0.1         # 潮汐振幅开启
+        )
 
     def reset_for_test(self, start_pos, final_target):
         self.current_step = 0
@@ -278,7 +280,7 @@ if __name__ == "__main__":
     
     # 🌟 加载你刚刚用 30万步 锐化后的极限 0.8 米模型！
     print("🧠 正在加载 0.8米 极限特训后的巅峰模型...")
-    model = SAC.load("sac_rov_edge8_no_current_no_fish_normal_distance_v1.zip") 
+    model = SAC.load("sac_rov_edge8_mild_current_no_fish_normal_dis.zip") 
     # print(model.policy)
     # 物理账本完全对齐训练环境
     START = np.array([0.0, 0.0, -5.0])  

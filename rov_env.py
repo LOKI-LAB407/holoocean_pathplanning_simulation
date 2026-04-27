@@ -25,11 +25,15 @@ class OceanCurrentSimulator:
         self.vortices = []
         self.phi_0 = np.random.uniform(0, 2 * np.pi) 
         for _ in range(self.num_vortices):
+            ## 漩涡坐标
             x0 = np.random.uniform(-self.map_size, self.map_size)
             y0 = np.random.uniform(-self.map_size, self.map_size)
-            z0 = np.random.uniform(-35.0, -2.0) 
+            z0 = np.random.uniform(-20.0, -2.0) 
+            ## 漩涡的深度强度
             sigma_z = np.random.uniform(3.0, 15.0) 
+            ## 漩涡水平强度 以及旋转方向
             eta = np.random.choice([1, -1]) * np.random.uniform(3.0, 8.0) 
+            ## 漩涡半径
             xi = np.random.uniform(4.0, 10.0) 
             self.vortices.append({'x0': x0, 'y0': y0, 'z0': z0, 'eta': eta, 'xi': xi, 'sigma_z': sigma_z})
 
