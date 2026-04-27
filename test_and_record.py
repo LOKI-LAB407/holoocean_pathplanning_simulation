@@ -1,348 +1,370 @@
 import os
+import cv2
 import time
-import cv2  # 📸 新增：导入 OpenCV 用于视频录制
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import holoocean
-from stable_baselines3 import PPO
-from rrt_planner import RRT3D # 导入我们刚写的规划器
-import pandas as pd
+from stable_baselines3 import SAC 
 
-# 1. 保护 C 盘
+# ==========================================
+# 🌊 1. 3D 洋流模型 (匹配 Phase 1：纯净泳池，无洋流)
+# ==========================================
+class OceanCurrentSimulator:
+    def __init__(self, num_vortices=0, map_size=25.0):
+        self.num_vortices = num_vortices
+        self.map_size = map_size
+        
+        # 🌟 调整 1：将洋流振幅降至 0.15，对齐 Edge 8 实机的抗流极限 (约 1.2 m/s)
+        self.A = 0.1
+        self.omega = 2 * np.pi / (12.4 * 3600) 
+        self.phi_0 = 0.0 
+        
+        self.vortices = []
+        
+    def reset(self):
+        self.vortices = []
+        self.phi_0 = np.random.uniform(0, 2 * np.pi) 
+        
+        ## 生成多个涡旋，每个涡旋在水平面上有随机位置和强度，在垂直方向上有不同的衰减特性
+        for _ in range(self.num_vortices):
+            x0 = np.random.uniform(-self.map_size, self.map_size)
+            y0 = np.random.uniform(-self.map_size, self.map_size)
+            z0 = np.random.uniform(-35.0, -2.0) 
+            sigma_z = np.random.uniform(3.0, 15.0) 
+            eta = np.random.choice([1, -1]) * np.random.uniform(3.0, 8.0) 
+            xi = np.random.uniform(4.0, 10.0) 
+            
+            self.vortices.append({
+                'x0': x0, 'y0': y0, 'z0': z0, 
+                'eta': eta, 'xi': xi, 'sigma_z': sigma_z
+            })
+
+    def get_current_velocity(self, x, y, z, t):
+        c_fx_base = 0.0
+        c_fy_base = 0.0
+        
+        for v in self.vortices:
+            dx = x - v['x0']
+            dy = y - v['y0']
+            r_sq = dx**2 + dy**2
+            
+            if r_sq < 1e-4:
+                decay_factor = 1.0 / (2 * np.pi * v['xi']**2)
+            else:
+                decay_factor = (1.0 - np.exp(-r_sq / (v['xi']**2))) / (2 * np.pi * r_sq)
+            
+            z_decay = np.exp(-((z - v['z0'])**2) / (v['sigma_z']**2))
+            
+            c_fx_base += -v['eta'] * dy * decay_factor * z_decay
+            c_fy_base +=  v['eta'] * dx * decay_factor * z_decay
+
+        time_factor = 1.0 + self.A * np.sin(self.omega * t + self.phi_0)
+        depth_ratio = np.clip(1.0 - abs(z)/40.0, 0.0, 1.0)
+        global_drift_x = 0.05 * time_factor * depth_ratio
+        global_drift_y = 0.03 * time_factor * depth_ratio
+        
+        # 1. 先计算出原始的合成流速
+        raw_vx = c_fx_base * time_factor + global_drift_x
+        raw_vy = c_fy_base * time_factor + global_drift_y
+        
+        # 2. 🌟 绝对物理安全锁：计算水平总流速并限速
+        MAX_CURRENT = 0.20  # 设定的洋流速度绝对上限 (m/s)
+        horiz_speed = np.linalg.norm([raw_vx, raw_vy])
+        
+        if horiz_speed > MAX_CURRENT:
+            # 等比例缩放，保证洋流的“方向”不变，只削弱“力度”
+            scale = MAX_CURRENT / horiz_speed
+            raw_vx *= scale
+            raw_vy *= scale
+
+        return np.array([raw_vx, raw_vy, 0.0])
+
+# ==========================================
+# 2. 底层物理环境 Wrapper (保持原有逻辑不变)
+# ==========================================
 os.environ["HOLOOCEAN_PATH"] = "D:\\HoloOceanEngine"
 os.environ["HOLOOCEAN_SYSTEM_PATH"] = "D:\\HoloOceanEngine"
 
-# ==========================================
-# 保持与训练完全一致的底层矩阵与配置
-# ==========================================
 def get_rov_mixing_matrix():
     M = np.zeros((8, 6))
-    M[0, :] = np.array([0,  0,    1,   -1,    1,    0])  
-    M[1, :] = np.array([0,  0,    1,    1,    1,    0])  
-    M[2, :] = np.array([0,  0,    1,   -1,   -1,    0])  
-    M[3, :] = np.array([0,  0,    1,    1,   -1,    0])  
-    M[4, :] = np.array([1, -1,    0,    0,    0,   -1])  
-    M[5, :] = np.array([1,  1,    0,    0,    0,    1])  
-    M[6, :] = np.array([1,  1,    0,    0,    0,   -1])  
-    M[7, :] = np.array([1, -1,    0,    0,    0,    1])  
+    M[0,:]=[ 1, -1,  0,  0,  0, -1]
+    M[1,:]=[ 1,  1,  0,  0,  0,  1]
+    M[2,:]=[ 1, -1,  0,  0,  0,  1]
+    M[3,:]=[ 1,  1,  0,  0,  0, -1]
+    M[4,:]=[ 0,  0,  1, -1,  1,  0]
+    M[5,:]=[ 0,  0,  1,  1,  1,  0]
+    M[6,:]=[ 0,  0,  1, -1, -1,  0]
+    M[7,:]=[ 0,  0,  1,  1, -1,  0]
     return M
 
-rov_config = {
-    "name": "ROV_Evaluate",
-    "world": "OpenWater",
-    "package_name": "Ocean", 
-    "main_agent": "my_rov",
-    "frames_per_sec": 30, 
-    "agents": [
-        {
-            "agent_name": "my_rov",
-            "agent_type": "HoveringAUV",
-            "control_scheme": 0, 
-            "location": [0.0, 0.0, -5.0], 
-            "sensors": [
-                {"sensor_type": "LocationSensor"}, 
-                {"sensor_type": "VelocitySensor"}, 
-                {"sensor_type": "RotationSensor"},
-                # 📸 新增：在测试环境中挂载高清摄像机
-                {
-                    "sensor_type": "RGBCamera",
-                    "socket": "CameraSocket", 
-                    "configuration": {
-                        "CaptureWidth": 512,  
-                        "CaptureHeight": 512
+class ROVFullTestWrapper(gym.Env):
+    def __init__(self):
+        super().__init__()
+        cfg = {
+            "name": "ROV_Full_Test", "world": "OpenWater", "package_name": "Ocean", "main_agent": "my_rov",
+            "frames_per_sec": 30, "agents": [{
+                "agent_name": "my_rov", "agent_type": "HoveringAUV", "control_scheme": 0, "location": [0,0,-5],
+                "sensors": [
+                    {"sensor_type": "LocationSensor"}, 
+                    {"sensor_type": "VelocitySensor"}, 
+                    {"sensor_type": "RotationSensor"},
+                    {"sensor_type": "IMUSensor"}, 
+                    {
+                        "sensor_type": "RGBCamera", 
+                        "sensor_name": "FollowCamera", 
+                        "location": [-3.5, 0.0, 1.5],
+                        "rotation": [0.0, -15.0, 0.0],
+                        "configuration": {
+                            "CaptureWidth": 1280, 
+                            "CaptureHeight": 720
+                        }
                     }
-                }
-            ]
+                ]
+            }]
         }
-    ]
-}
-
-# ==========================================
-# 检验专用 Wrapper (加入了轨迹绘制功能)
-# ==========================================
-class ROVEvalWrapper(gym.Env):
-    def __init__(self, config):
-        super(ROVEvalWrapper, self).__init__()
-        self.holo_env = holoocean.make(scenario_cfg=config)
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32)
+        self.holo_env = holoocean.make(scenario_cfg=cfg)
+        self.action_space = spaces.Box(-1.0, 1.0, (6,), np.float32)
+        self.observation_space = spaces.Box(-np.inf, np.inf, (25,), np.float32) 
         self.tam_inverse = get_rov_mixing_matrix()
-        
+        self.ocean_sim = OceanCurrentSimulator()
         self.target_pos = np.zeros(3)
-        self.last_pos = np.zeros(3)
+        self.buoyancy_bias = np.zeros(8)
+        self.buoyancy_bias[4:8] = 3.0
         
-        self.max_current_power = 0.0 
-        self.current_disturbance = np.zeros(8)
+        self.sonar_max_range = 30.0  
+        self.sonar_min_range = 0.5   
+        self.vertical_fov = np.deg2rad(15) 
 
-    def reset(self, seed=None, options=None):
+        self.sonar_ray_dirs = []
+        for angle in [-60, -30, 0, 30, 60]:
+            self.sonar_ray_dirs.append([np.cos(np.deg2rad(angle)), np.sin(np.deg2rad(angle)), 0.0])
+        for angle in [-40, 0, 40]:
+            self.sonar_ray_dirs.append([np.cos(np.deg2rad(angle))*np.cos(np.deg2rad(25)), np.sin(np.deg2rad(angle))*np.cos(np.deg2rad(25)), np.sin(np.deg2rad(25))])
+        for angle in [-40, 0, 40]:
+            self.sonar_ray_dirs.append([np.cos(np.deg2rad(angle))*np.cos(np.deg2rad(-25)), np.sin(np.deg2rad(angle))*np.cos(np.deg2rad(-25)), np.sin(np.deg2rad(-25))])
+        
+        self.num_sonar_rays = len(self.sonar_ray_dirs)
+        self.clean_sonar_ranges = np.ones(self.num_sonar_rays) * self.sonar_max_range
+        self.ocean_sim = OceanCurrentSimulator(num_vortices=0, map_size=25.0)
+
+    def reset_for_test(self, start_pos, final_target):
         self.current_step = 0
+        self.target_pos = final_target
+        self.ocean_sim.reset()
         
         obs_dict = self.holo_env.reset()
-        self.current_obs_dict = obs_dict
-        self.start_pos = np.array(obs_dict["LocationSensor"])
-        self.final_target = np.array([15.0, 15.0, -8.0]) 
+        self.current_obs_dict = obs_dict  
+        self.holo_env.agents["my_rov"].teleport(start_pos) 
         
-        self.obstacles = [
-            (5.0, 5.0, -5.0, 3.0),   
-            (10.0, 10.0, -8.0, 4.0)  
-        ]
-        
-        if self.max_current_power == 0.0:
-            print(f"\n🌊 本次测试：无洋流干扰，纯净环境！")
-        else:
-            print(f"\n🌊 本次测试：洋流干扰强度为 {self.max_current_power}！")
-        self.current_disturbance = np.random.uniform(-self.max_current_power, self.max_current_power, size=(8,))
-        
-        try:
-            self.holo_env.draw_box(center=self.final_target.tolist(), extent=[1.0, 1.0, 1.0], color=[255, 0, 0], lifetime=0)
-            
-            for obs in self.obstacles:
-                self.holo_env.draw_box(
-                    center=list(obs[:3]), 
-                    extent=[obs[3], obs[3], obs[3]], 
-                    color=[255, 255, 0], 
-                    lifetime=0.1
-                ) 
-        except Exception as e:
-            print(f"⚠️ 画石头警告: {e}")
-            
-        return self._get_obs(obs_dict), {}
+        return self._get_obs(obs_dict)
 
     def step(self, action):
         self.current_step += 1
+        dt = 1/30.0
+        obs_d = self.current_obs_dict 
         
-        dvl_velocity_world = np.array(self.current_obs_dict["VelocitySensor"]) 
-        _, _, yaw_deg = self.current_obs_dict["RotationSensor"]
-        yaw_rad = np.deg2rad(yaw_deg)
+        curr_p = obs_d["LocationSensor"]
+        v_world = obs_d["VelocitySensor"]
+        roll, pitch, yaw = np.deg2rad(obs_d["RotationSensor"])
+        
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cr, sr = np.cos(roll), np.sin(roll)
 
-        cos_y = np.cos(yaw_rad)
-        sin_y = np.sin(yaw_rad)
+        R_yaw = np.array([[cy, sy, 0], [-sy, cy, 0], [0, 0, 1]])
+        R_pitch = np.array([[cp, 0, -sp], [0, 1, 0], [sp, 0, cp]])
+        R_roll = np.array([[1, 0, 0], [0, cr, sr], [0, -sr, cr]])
+        R_world2body = R_roll @ R_pitch @ R_yaw
         
-        vx_world, vy_world, vz_world = dvl_velocity_world[0], dvl_velocity_world[1], dvl_velocity_world[2]
+        vx_body, vy_body, vz_body = R_world2body @ v_world
         
-        vx_body = vx_world * cos_y + vy_world * sin_y   
-        vy_body = -vx_world * sin_y + vy_world * cos_y  
-        vz_body = vz_world                              
+        v_c = self.ocean_sim.get_current_velocity(curr_p[0], curr_p[1], curr_p[2], self.current_step*dt)
+        v_cx_body, v_cy_body, v_cz_body = R_world2body @ v_c
         
-        dvl_velocity_body = np.array([vx_body, vy_body, vz_body])
+        rel_vx = vx_body - v_cx_body
+        rel_vy = vy_body - v_cy_body
+        rel_vz = vz_body - v_cz_body
         
-        k_dvl = 2.5 
-        dvl_compensation_6d = np.zeros(6)
-        dvl_compensation_6d[0:3] = -dvl_velocity_body * k_dvl 
+        force_x_body = -20.0 * rel_vx * abs(rel_vx)
+        force_y_body = -20.0 * rel_vy * abs(rel_vy)
+        force_z_body = -30.0 * rel_vz * abs(rel_vz)
+        force_6dof_body = np.array([force_x_body, force_y_body, force_z_body, 0.0, 0.0, force_y_body * -0.2])
         
-        combined_action = action + dvl_compensation_6d / 50.0 
+        pinv_M_T = np.linalg.pinv(self.tam_inverse.T)
+        dist_8d = np.dot(pinv_M_T, force_6dof_body)
         
-        thruster_commands = np.dot(self.tam_inverse, combined_action)
-        max_thrust = np.max(np.abs(thruster_commands))
-        if max_thrust > 1.0:
-            thruster_commands = thruster_commands / max_thrust
+        thruster_commands = np.dot(self.tam_inverse, action)
+        max_t = np.max(np.abs(thruster_commands))
+        if max_t > 1.0: 
+            thruster_commands /= max_t
             
-        actual_physics_force = np.clip(thruster_commands * 50.0 + self.current_disturbance, -100.0, 100.0)
+        actual_physics_force = np.clip(
+            thruster_commands * 65.0 + dist_8d + self.buoyancy_bias, 
+            -500.0, 500.0
+        )
         
         obs_dict_new = self.holo_env.step(actual_physics_force.tolist())
-
-        try:
-            for obs in self.obstacles:
-                self.holo_env.draw_box(
-                    center=list(obs[:3]), 
-                    extent=[obs[3], obs[3], obs[3]], 
-                    color=[255, 255, 0], 
-                    lifetime=0.2         
-                )
-        except Exception as e:
-            print(f"⚠️ step中画石头警告: {e}")
-        
         self.current_obs_dict = obs_dict_new
-        obs = self._get_obs(obs_dict_new)
+        self.clean_sonar_ranges = np.ones(self.num_sonar_rays) * self.sonar_max_range
         
-        current_pos = obs_dict_new["LocationSensor"]
-        
-        try:
-            self.holo_env.draw_line(
-                start=self.last_pos.tolist(), 
-                end=current_pos.tolist(), 
-                color=[0, 255, 0],  
-                thickness=3.0, 
-                lifetime=0          
-            )
-        except Exception:
-            pass
-            
-        self.last_pos = current_pos 
-        
-        distance_to_target = np.linalg.norm(self.target_pos - current_pos)
-        roll_deg, pitch_deg, _ = obs_dict_new["RotationSensor"]
-        terminated = False
-        
-        if distance_to_target < 1.0:
-            print(f"🚀 精准到达目标点！耗时 {self.current_step} 步")
-            terminated = True
-        elif distance_to_target > 40.0:
-            print("💀 游得太远，迷失在深海。")
-            terminated = True
-        elif abs(roll_deg) > 60.0 or abs(pitch_deg) > 60.0:
-            print(f"💀 姿态翻车! 倾角过大 (Roll: {roll_deg:.1f}°, Pitch: {pitch_deg:.1f}°)")
-            terminated = True
-            
-        return obs, 0.0, terminated, False, {}
-    
+        return self._get_obs(obs_dict_new), obs_dict_new
+
     def _get_obs(self, obs_dict):
         current_pos = np.array(obs_dict["LocationSensor"])
         velocity_world = np.array(obs_dict["VelocitySensor"])
-        roll_deg, pitch_deg, yaw_deg = obs_dict["RotationSensor"]
+        roll, pitch, yaw = np.deg2rad(obs_dict["RotationSensor"])
+        
+        dx, dy, dz = self.target_pos[0] - current_pos[0], self.target_pos[1] - current_pos[1], self.target_pos[2] - current_pos[2]
 
-        roll = np.deg2rad(roll_deg)
-        pitch = np.deg2rad(pitch_deg)
-        yaw = np.deg2rad(yaw_deg)
+        R_yaw = np.array([[np.cos(yaw), np.sin(yaw), 0], [-np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
+        R_pitch = np.array([[np.cos(pitch), 0, -np.sin(pitch)], [0, 1, 0], [np.sin(pitch), 0, np.cos(pitch)]])
+        R_roll = np.array([[1, 0, 0], [0, np.cos(roll), np.sin(roll)], [0, -np.sin(roll), np.cos(roll)]])
+        R_world2body = R_roll @ R_pitch @ R_yaw
 
-        dx = self.target_pos[0] - current_pos[0]
-        dy = self.target_pos[1] - current_pos[1]
-        dz = self.target_pos[2] - current_pos[2]
-
-        cos_y = np.cos(yaw)
-        sin_y = np.sin(yaw)
-
-        rel_x_body = dx * cos_y + dy * sin_y   
-        rel_y_body = -dx * sin_y + dy * cos_y  
-        rel_z_body = dz                      
-        relative_pos_body = np.array([rel_x_body, rel_y_body, rel_z_body])
-
-        v_surge = velocity_world[0] * cos_y + velocity_world[1] * sin_y  
-        v_sway = -velocity_world[0] * sin_y + velocity_world[1] * cos_y 
-        v_heave = velocity_world[2]
-        velocity_body = np.array([v_surge, v_sway, v_heave])
+        relative_pos_body = R_world2body @ np.array([dx, dy, dz])
+        velocity_body = R_world2body @ velocity_world
 
         target_yaw = np.arctan2(dy, dx)
         yaw_error = (target_yaw - yaw + np.pi) % (2 * np.pi) - np.pi
-        rotation_body = np.array([roll, pitch, yaw_error])
+        
+        sonar_ranges = self.clean_sonar_ranges.copy()
+        norm_sonar = sonar_ranges / self.sonar_max_range
+        
+        imu_data = np.array(obs_dict["IMUSensor"])
+        angular_velocity = imu_data[1] 
 
-        state = np.concatenate([relative_pos_body, velocity_body, rotation_body])
+        norm_relative_pos = np.clip(relative_pos_body / 40.0, -1.5, 1.5)
+        norm_velocity = np.clip(velocity_body / 2.0, -2.0, 2.0)
+        norm_rotation = np.array([
+            np.clip(roll / 1.0, -1.2, 1.2),     
+            np.clip(pitch / 1.0, -1.2, 1.2),   
+            np.sin(yaw_error),          
+            np.cos(yaw_error)           
+        ])
+        norm_angular_vel = np.clip(angular_velocity / 1.5, -2.0, 2.0)
+        norm_absolute_depth = np.clip(current_pos[2] / 40.0, -1.0, 0.0)
+
+        state = np.concatenate([
+            norm_relative_pos, np.array([norm_absolute_depth]), norm_velocity, 
+            norm_rotation, norm_angular_vel, norm_sonar           
+        ])
         return state.astype(np.float32)
 
 # ==========================================
-# 运行检验！
+# 🌟 3. 核心新增：参数化平滑曲线生成器
 # ==========================================
-import pandas as pd  # 📊 记得在文件最上方加上这句 pandas 导入！
+def generate_smooth_curve(start_pos, end_pos, num_points=50):
+    """
+    生成一条起止点在训练范围内，且具有平滑侧向凸起的 3D 曲线
+    """
+    t = np.linspace(0, 1, num_points)
+    path = np.zeros((num_points, 3))
+    
+    # X 和 Z 轴进行线性插值
+    path[:, 0] = start_pos[0] + t * (end_pos[0] - start_pos[0])
+    path[:, 2] = start_pos[2] + t * (end_pos[2] - start_pos[2])
+    
+    # Y 轴加入正弦波形，使其向侧面凸出 2.5 米，形成平滑的弧线
+    path[:, 1] = start_pos[1] + t * (end_pos[1] - start_pos[1]) + np.sin(t * np.pi) * 2.5
+    
+    return path
 
 # ==========================================
-# 运行检验与双重记录（视频 + CSV数据）
+# 4. 运行控制塔
 # ==========================================
 if __name__ == "__main__":
-    env = ROVEvalWrapper(rov_config)
-    model = PPO.load("ppo_rov_dynamic_v1_final") # 替换为你的最终模型名
+    env = ROVFullTestWrapper()
     
-    obs, _ = env.reset()
+    # 🌟 加载你刚刚用 30万步 锐化后的极限 0.8 米模型！
+    print("🧠 正在加载 0.8米 极限特训后的巅峰模型...")
+    model = SAC.load("sac_rov_edge8_no_current_no_fish_normal_distance_v1.zip") 
+    # print(model.policy)
+    # 物理账本完全对齐训练环境
+    START = np.array([0.0, 0.0, -5.0])  
+    GOAL = np.array([12.0, 12.0, -12.0])    
     
-    # 1. 启动上帝视角的导航仪 (RRT)
-    bounds = [(-20, 20), (-20, 20), (-15, 0)] 
-    planner = RRT3D(env.start_pos, env.final_target, env.obstacles, bounds, step_size=2.0)
+    print(f"🎯 任务确立：训练域内极限追踪！从 {START} 潜航至 {GOAL}")
     
-    global_path = planner.plan()
+    # 抛弃 DEPlanner，直接生成绝对平滑的 50 个密集航点
+    global_path = generate_smooth_curve(START, GOAL, num_points=50)
     
-    if global_path is None:
-        print("无法规划出安全路径，任务取消！")
-        exit()
+    if len(global_path) > 0:
+        obs = env.reset_for_test(START, np.array(global_path[1]))
+        wp_idx = 1
         
-    print(f"✅ 规划成功！共生成 {len(global_path)} 个航点。开始执行底层追踪...")
-    
-    try:
+        # 画出平滑的绿色引导曲线
         for i in range(len(global_path)-1):
-            env.holo_env.draw_line(global_path[i].tolist(), global_path[i+1].tolist(), color=[0, 0, 255], thickness=2.0, lifetime=0)
-    except Exception:
-        pass
-
-    # 🎥 2. OpenCV 视频录制初始化
-    video_filename = "rov_evaluation_fpv.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
-    fps = 30.0
-    width, height = 512, 512
-    out = cv2.VideoWriter(video_filename, fourcc, fps, (width, height))
-    print(f"🔴 开始录制第一人称视频: {video_filename}")
-
-    # =======================================================
-    # 📊 新增位置 1：在进入循环前，初始化空列表用于装载数据
-    # =======================================================
-    trajectory_data = []
-    print(f"🔴 开始记录 3D 轨迹数据...")
-
-    # 3. 开始逐个追踪航点
-    current_waypoint_index = 1 
-    done = False
-    
-    while not done and current_waypoint_index < len(global_path):
-        current_target = global_path[current_waypoint_index]
-        env.target_pos = current_target 
-        
-        obs = env._get_obs(env.current_obs_dict)
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, truncated, info = env.step(action)
-        
-        current_pos = env.current_obs_dict["LocationSensor"]
-        
-        # =======================================================
-        # 📊 新增位置 2：在 step() 执行完，立刻把当前坐标存进字典
-        # =======================================================
-        record = {
-            "step": env.current_step,
-            "rov_x": current_pos[0],
-            "rov_y": current_pos[1],
-            "rov_z": current_pos[2]
-        }
-        
-        # 如果测试环境中开启了动态障碍物，一并记录它们的位置
-        if hasattr(env, 'dynamic_obs'):
-            for idx, obs_data in enumerate(env.dynamic_obs):
-                record[f"obs_{idx}_x"] = obs_data['pos'][0]
-                record[f"obs_{idx}_y"] = obs_data['pos'][1]
-                record[f"obs_{idx}_z"] = obs_data['pos'][2]
-                record[f"obs_{idx}_r"] = obs_data['radius']
-                
-        trajectory_data.append(record)
-        # =======================================================
-
-        # 判断是否到达当前航点
-        distance_to_waypoint = np.linalg.norm(current_target - current_pos)
-        if distance_to_waypoint < 1.5: 
-            print(f"到达航点 {current_waypoint_index}，切换下一个目标！")
-            current_waypoint_index += 1
+            env.holo_env.draw_line(global_path[i].tolist(), global_path[i+1].tolist(), color=[0, 255, 0], thickness=2.0, lifetime=0)
             
-        # 静态礁石碰撞检测
-        for obs_data in env.obstacles:
-            if np.linalg.norm(current_pos - obs_data[:3]) < obs_data[3]:
-                print("💥 灾难：偏离航线，撞击礁石！")
-                done = True
+        print("🚀 纯净平滑弧线铺设完毕！SAC 开始执行高精度跟踪任务...")
+        prev_p = np.copy(START)
+        
+        for step in range(3500):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, raw_d = env.step(action)
+            curr_p = raw_d["LocationSensor"]
+            
+            env.holo_env.draw_line(prev_p.tolist(), curr_p.tolist(), color=[255, 0, 0], thickness=4.0, lifetime=0)
+            prev_p = np.copy(curr_p) 
+            
+            # 🌟 核心修改：极其严苛的 0.8 米航点切换逻辑
+            # 只有当 ROV 贴近当前航点小于 0.8 米时，才允许切换到下一个航点！
+            # 这完美触发了它在训练中 "distance_to_target < 0.8" 时拿 3000 分的冲刺记忆。
+            target_hit_radius = 0.8
+            if np.linalg.norm(curr_p - np.array(global_path[wp_idx])) < target_hit_radius and wp_idx < len(global_path)-1:
+                wp_idx += 1
+                env.target_pos = np.array(global_path[wp_idx])
+
+            # --- 画面渲染 ---
+            # --- 画面渲染与指标精算 ---
+            frame = cv2.cvtColor(np.uint8(raw_d["FollowCamera"]), cv2.COLOR_RGBA2BGR)
+            cv2.putText(frame, f"MISSION: SMOOTH CURVE", (40, 50), 2, 0.8, (0, 165, 255), 2)
+            cv2.putText(frame, f"WAYPOINT: {wp_idx}/{len(global_path)-1}", (40, 90), 2, 0.8, (0, 255, 0), 2)
+
+            # ==========================================
+            # 🌟 核心新增：3D 横向跟踪误差 (Cross-Track Error) 精算
+            # ==========================================
+            # 1. 获取当前线段的起点 (上一个航点) 和终点 (当前目标航点)
+            prev_wp = np.array(global_path[max(0, wp_idx-1)])
+            curr_wp = np.array(global_path[wp_idx])
+            
+            # 2. 计算航线向量与 ROV 位移向量
+            vec_path = curr_wp - prev_wp          # 航线的方向向量
+            vec_rov = curr_p - prev_wp            # ROV 相对于线段起点的向量
+            
+            # 3. 向量叉乘计算正交距离
+            path_length = np.linalg.norm(vec_path)
+            if path_length > 1e-4:
+                # 叉乘的模长除以底边长，即为平行四边形的高（ROV 到直线的绝对距离）
+                cross_track_error = np.linalg.norm(np.cross(vec_path, vec_rov)) / path_length
+            else:
+                cross_track_error = np.linalg.norm(curr_p - curr_wp)
+                
+            # 4. 计算到当前航点的直线距离 (供参考比对)
+            dist_to_wp = np.linalg.norm(curr_p - curr_wp)
+
+            # 将精算结果打印到屏幕左侧 (红色代表越界警告色，白色代表安全)
+            cte_color = (0, 0, 255) if cross_track_error > 0.5 else (255, 255, 255)
+            cv2.putText(frame, f"CTE (ERR): {cross_track_error:.3f} m", (40, 130), 2, 0.8, cte_color, 2)
+            cv2.putText(frame, f"DIST TO WP: {dist_to_wp:.2f} m", (40, 170), 2, 0.8, (255, 255, 0), 2)
+            # ==========================================
+
+            yaw_err_deg = np.rad2deg(obs[8]) 
+            cv2.putText(frame, f"YAW ERR: {yaw_err_deg:+.1f} deg", (950, 50), 2, 0.8, (0, 255, 255), 2)
+
+            if curr_p[2] > -0.5 or curr_p[2] < -39.0:
+                cv2.putText(frame, "OUT OF BOUNDS!", (100, 360), 2, 4.0, (0, 0, 255), 8)
+                cv2.imshow("ROV Curve Test", frame)
+                cv2.waitKey(2000) 
                 break
-        
-        # 📸 视频抽帧逻辑
-        if "RGBCamera" in env.current_obs_dict:
-            rgba_img = env.current_obs_dict["RGBCamera"]
-            rgba_img = np.uint8(rgba_img)
-            bgr_img = cv2.cvtColor(rgba_img, cv2.COLOR_RGBA2BGR)
-            
-            speed = np.linalg.norm(env.current_obs_dict["VelocitySensor"])
-            cv2.putText(bgr_img, f"Speed: {speed:.2f} m/s", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(bgr_img, f"Target WP: {current_waypoint_index}/{len(global_path)-1}", (15, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            
-            out.write(bgr_img)
-            cv2.imshow("ROV First-Person View", bgr_img)
-            cv2.waitKey(1) 
-                
-        time.sleep(0.02) # 控制展示速度
-        
-    if current_waypoint_index >= len(global_path):
-        print("🎉 完美避障！ROV 成功抵达最终目的地！")
 
-    # 🛑 4. 循环结束，释放视频资源
-    out.release()
-    cv2.destroyAllWindows()
-    print("🎬 视频录制结束！")
-
-    # =======================================================
-    # 📊 新增位置 3：一切结束后，将收集到的列表转为 CSV 文件
-    # =======================================================
-    if len(trajectory_data) > 0:
-        df = pd.DataFrame(trajectory_data)
-        csv_filename = "rov_trajectory_data.csv"
-        df.to_csv(csv_filename, index=False)
-        print(f"📄 轨迹数据已成功保存至: {csv_filename} (可用于生成论文 3D 轨迹图)")
+            cv2.imshow("ROV Curve Test", frame)
+            
+            # 终极胜利判定
+            if wp_idx == len(global_path)-1 and np.linalg.norm(curr_p - GOAL) < 0.8:
+                print("🏁 测试通过！ROV 完美贴合了 3D 弧线飞行！")
+                break
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'): 
+                break

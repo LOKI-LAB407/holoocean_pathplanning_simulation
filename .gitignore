@@ -1,0 +1,26 @@
+# ==========================================
+# Edge8 ROV 项目 Git 忽略清单 (Blacklist)
+# ==========================================
+
+# 1. 忽略 Python 自动生成的缓存文件夹
+__pycache__/
+*.pyc
+
+# 2. 🌟 忽略庞大的强化学习模型权重文件 (极其关键)
+rov_models/
+*.zip
+
+sac_rov_edge8_no_current_no_fish_normal_distance_v1.zip
+sac_rov_edge8_no_current_no_fish_small_distance_v1.zip
+
+# 3. 🌟 忽略 TensorBoard 训练日志 (每天都在变大，不需要传)
+rov_tensorboard/
+
+# 4. 忽略一些临时的草稿或文本输出
+draft.txt
+code.txt
+trainninf_result/
+
+# 5. 忽略操作系统的隐藏文件
+.DS_Store
+Thumbs.db

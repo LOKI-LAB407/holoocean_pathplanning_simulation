@@ -1,31 +1,29 @@
+# 文件名: rov_env.py
 import os
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import holoocean
-from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import CheckpointCallback
 
 # ==========================================
-# 🌊 工业级 3D 海流孪生模型 (Lamb Vortex + Gaussian Vertical Decay)
+# 0. 保护 C 盘与引擎路径配置
 # ==========================================
+os.environ["HOLOOCEAN_PATH"] = "D:\\HoloOceanEngine"
+os.environ["HOLOOCEAN_SYSTEM_PATH"] = "D:\\HoloOceanEngine"
+
 class OceanCurrentSimulator:
-    def __init__(self, num_vortices=0, map_size=25.0):
+    def __init__(self, num_vortices=0, map_size=25.0, max_current=0.1, amplitude=0.0):
         self.num_vortices = num_vortices
         self.map_size = map_size
-        
-        # 🌟 调整 1：将洋流振幅降至 0.15，对齐 Edge 8 实机的抗流极限 (约 1.2 m/s)
-        self.A = 0
+        self.max_current = max_current  
+        self.A = amplitude  # 🌟 动态接收潮汐振幅
         self.omega = 2 * np.pi / (12.4 * 3600) 
         self.phi_0 = 0.0 
-        
         self.vortices = []
         
     def reset(self):
         self.vortices = []
         self.phi_0 = np.random.uniform(0, 2 * np.pi) 
-        
-        ## 生成多个涡旋，每个涡旋在水平面上有随机位置和强度，在垂直方向上有不同的衰减特性
         for _ in range(self.num_vortices):
             x0 = np.random.uniform(-self.map_size, self.map_size)
             y0 = np.random.uniform(-self.map_size, self.map_size)
@@ -33,28 +31,20 @@ class OceanCurrentSimulator:
             sigma_z = np.random.uniform(3.0, 15.0) 
             eta = np.random.choice([1, -1]) * np.random.uniform(3.0, 8.0) 
             xi = np.random.uniform(4.0, 10.0) 
-            
-            self.vortices.append({
-                'x0': x0, 'y0': y0, 'z0': z0, 
-                'eta': eta, 'xi': xi, 'sigma_z': sigma_z
-            })
+            self.vortices.append({'x0': x0, 'y0': y0, 'z0': z0, 'eta': eta, 'xi': xi, 'sigma_z': sigma_z})
 
     def get_current_velocity(self, x, y, z, t):
         c_fx_base = 0.0
         c_fy_base = 0.0
-        
         for v in self.vortices:
             dx = x - v['x0']
             dy = y - v['y0']
             r_sq = dx**2 + dy**2
-            
             if r_sq < 1e-4:
                 decay_factor = 1.0 / (2 * np.pi * v['xi']**2)
             else:
                 decay_factor = (1.0 - np.exp(-r_sq / (v['xi']**2))) / (2 * np.pi * r_sq)
-            
             z_decay = np.exp(-((z - v['z0'])**2) / (v['sigma_z']**2))
-            
             c_fx_base += -v['eta'] * dy * decay_factor * z_decay
             c_fy_base +=  v['eta'] * dx * decay_factor * z_decay
 
@@ -63,64 +53,28 @@ class OceanCurrentSimulator:
         global_drift_x = 0.05 * time_factor * depth_ratio
         global_drift_y = 0.03 * time_factor * depth_ratio
         
-        # 1. 先计算出原始的合成流速
         raw_vx = c_fx_base * time_factor + global_drift_x
         raw_vy = c_fy_base * time_factor + global_drift_y
         
-        # 2. 🌟 绝对物理安全锁：计算水平总流速并限速
-        MAX_CURRENT = 0.1  # 设定的洋流速度绝对上限 (m/s)
+        # 🌟 使用外部传入的最大限速
         horiz_speed = np.linalg.norm([raw_vx, raw_vy])
-        
-        if horiz_speed > MAX_CURRENT:
-            # 等比例缩放，保证洋流的“方向”不变，只削弱“力度”
-            scale = MAX_CURRENT / horiz_speed
+        if horiz_speed > self.max_current:
+            scale = self.max_current / horiz_speed
             raw_vx *= scale
             raw_vy *= scale
 
         return np.array([raw_vx, raw_vy, 0.0])
 
-# ==========================================
-# 0. 保护 C 盘与引擎路径配置
-# ==========================================
-os.environ["HOLOOCEAN_PATH"] = "D:\\HoloOceanEngine"
-os.environ["HOLOOCEAN_SYSTEM_PATH"] = "D:\\HoloOceanEngine"
-
 def get_rov_mixing_matrix():
-    # 矩阵维度: [8个推进器, 6个自由度(Surge, Sway, Heave, Roll, Pitch, Yaw)]
     M = np.zeros((8, 6))
-    
-    # ========================================================
-    # 🔹 物理通道 1-4：水平推进器组 (完全根据 QGC 构型图)
-    # 注意：QGC复选框已处理后部电机反转，所以 Surge (第一列) 全部是 1
-    # ========================================================
-    # M1 (右前): 往前推(+1)，往右偏(-1)，导致左转(-1)
     M[0, :] = np.array([ 1, -1,  0,  0,  0, -1])  
-    
-    # M2 (左前): 往前推(+1)，往左偏(+1)，导致右转(+1)
     M[1, :] = np.array([ 1,  1,  0,  0,  0,  1])  
-    
-    # M3 (右后): 往前推(+1)，往右偏(-1)，导致右转(+1)
     M[2, :] = np.array([ 1, -1,  0,  0,  0,  1])  
-    
-    # M4 (左后): 往前推(+1)，往左偏(+1)，导致左转(-1)
     M[3, :] = np.array([ 1,  1,  0,  0,  0, -1])  
-    
-    # ========================================================
-    # 🔹 物理通道 5-8：垂直推进器组 (完全根据 QGC 构型图)
-    # 注意：Heave(下潜/上升，第三列) 全部是 1
-    # ========================================================
-    # M5 (右侧前): 往上推(+1)，导致向左横滚(-1)，向下低头(+1)
     M[4, :] = np.array([ 0,  0,  1, -1,  1,  0])  
-    
-    # M6 (左侧前): 往上推(+1)，导致向右横滚(+1)，向下低头(+1)
     M[5, :] = np.array([ 0,  0,  1,  1,  1,  0])  
-    
-    # M7 (右侧后): 往上推(+1)，导致向左横滚(-1)，向上抬头(-1)
     M[6, :] = np.array([ 0,  0,  1, -1, -1,  0])  
-    
-    # M8 (左侧后): 往上推(+1)，导致向右横滚(+1)，向上抬头(-1)
     M[7, :] = np.array([ 0,  0,  1,  1, -1,  0])  
-
     return M
 
 rov_config = {
@@ -129,31 +83,35 @@ rov_config = {
     "package_name": "Ocean", 
     "main_agent": "my_rov",
     "frames_per_sec": 30, 
-    "agents": [
-        {
-            "agent_name": "my_rov",
-            "agent_type": "HoveringAUV",
-            "control_scheme": 0, 
-            ## 初始位置设置在水面下 5 米，远离边界，给它足够的空间来感知和学习  
-            "location": [0.0, 0.0, -5.0], 
-            "sensors": [
-                {"sensor_type": "LocationSensor"}, 
-                {"sensor_type": "VelocitySensor"}, 
-                {"sensor_type": "RotationSensor"},
-                {"sensor_type": "IMUSensor",
-                 "socket": "IMUSocket"
-                 }  
-            ]
-        }
-    ]
+    "agents": [{
+        "agent_name": "my_rov",
+        "agent_type": "HoveringAUV",
+        "control_scheme": 0, 
+        "location": [0.0, 0.0, -5.0], 
+        "sensors": [
+            {"sensor_type": "LocationSensor"}, 
+            {"sensor_type": "VelocitySensor"}, 
+            {"sensor_type": "RotationSensor"},
+            {"sensor_type": "IMUSensor", "socket": "IMUSocket"}  
+        ]
+    }]
 }
 
-# ==========================================
-# 2. 核心环境 Wrapper
-# ==========================================
 class ROVP2PDynamicWrapper(gym.Env):
-    def __init__(self, config):
+    # 🌟 核心解耦：引入 curriculum_config 字典接收难度指令
+    def __init__(self, config, curriculum_config=None):
         super(ROVP2PDynamicWrapper, self).__init__()
+        
+        # 解析难度配置（如果没有传入，则提供默认的安全兜底配置）
+        if curriculum_config is None:
+            curriculum_config = {}
+        self.target_dist_range = curriculum_config.get("target_dist_range", (5.0, 8.0))
+        self.dz_range = curriculum_config.get("dz_range", (-15.0, -2.0))
+        self.num_vortices = curriculum_config.get("num_vortices", 0)
+        self.max_current = curriculum_config.get("max_current", 0.0)
+        self.num_dynamic_obs = curriculum_config.get("num_dynamic_obs", 0)
+        self.amplitude = curriculum_config.get("amplitude", 0.0)
+
         self.holo_env = holoocean.make(scenario_cfg=config, show_viewport=False)
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(25,), dtype=np.float32)
@@ -166,7 +124,6 @@ class ROVP2PDynamicWrapper(gym.Env):
         self.water_bottom_z = -40.0    
         
         self.target_pos = np.zeros(3)
-        self.prev_waypoint = np.zeros(3)
         self.previous_distance = 0.0
         self.previous_action = np.zeros(6) 
         self.current_disturbance = np.zeros(8) 
@@ -174,49 +131,43 @@ class ROVP2PDynamicWrapper(gym.Env):
         self.buoyancy_bias = np.zeros(8)
         self.buoyancy_bias[4:8] = 3.0
 
-        self.ocean_sim = OceanCurrentSimulator(num_vortices=0, map_size=25.0)
+        # 🌟 动态初始化洋流模拟器
+        self.ocean_sim = OceanCurrentSimulator(
+            num_vortices=self.num_vortices, 
+            map_size=25.0,
+            max_current=self.max_current,
+            amplitude=self.amplitude 
+        )
 
-        # 🌟 11 射线 3D 全景声呐配置
         self.sonar_max_range = 30.0  
         self.sonar_min_range = 0.5   
-        self.vertical_fov = np.deg2rad(15) # 减小 FOV，因为射线变密了
+        self.vertical_fov = np.deg2rad(15)
 
         self.sonar_ray_dirs = []
-        # 1. 水平面 5 条
         for angle in [-60, -30, 0, 30, 60]:
             self.sonar_ray_dirs.append([np.cos(np.deg2rad(angle)), np.sin(np.deg2rad(angle)), 0.0])
-        # 2. 向上俯仰 25度 的 3 条
         for angle in [-40, 0, 40]:
-            self.sonar_ray_dirs.append([np.cos(np.deg2rad(angle))*np.cos(np.deg2rad(25)), 
-                                        np.sin(np.deg2rad(angle))*np.cos(np.deg2rad(25)), np.sin(np.deg2rad(25))])
-        # 3. 向下俯仰 25度 的 3 条
+            self.sonar_ray_dirs.append([np.cos(np.deg2rad(angle))*np.cos(np.deg2rad(25)), np.sin(np.deg2rad(angle))*np.cos(np.deg2rad(25)), np.sin(np.deg2rad(25))])
         for angle in [-40, 0, 40]:
-            self.sonar_ray_dirs.append([np.cos(np.deg2rad(angle))*np.cos(np.deg2rad(-25)), 
-                                        np.sin(np.deg2rad(angle))*np.cos(np.deg2rad(-25)), np.sin(np.deg2rad(-25))])
+            self.sonar_ray_dirs.append([np.cos(np.deg2rad(angle))*np.cos(np.deg2rad(-25)), np.sin(np.deg2rad(angle))*np.cos(np.deg2rad(-25)), np.sin(np.deg2rad(-25))])
 
-        
-        self.num_sonar_rays = len(self.sonar_ray_dirs) # 变成 11 条
+        self.num_sonar_rays = len(self.sonar_ray_dirs)
         self.clean_sonar_ranges = np.ones(self.num_sonar_rays) * self.sonar_max_range
-
-        # 🌟 性能优化：提前计算并缓存 TAM 转置的伪逆矩阵
         self.pinv_M_T = np.linalg.pinv(self.tam_inverse.T)
 
     def _generate_dynamic_obstacles(self):
         self.dynamic_obs = []
-        # num_obstacles = np.random.randint(6, 10) # 🌟 数量翻倍：变成鱼群
-        num_obstacles = 0
-        for _ in range(num_obstacles):
+        # 🌟 动态读取障碍物数量
+        for _ in range(self.num_dynamic_obs):
             pos = self.target_pos * np.random.uniform(0.2, 0.8) 
             pos += np.random.uniform(-8.0, 8.0, 3) 
             pos[2] = np.clip(pos[2], self.water_bottom_z + 2, self.water_surface_z - 2)
             
             vel = np.random.uniform(-1.0, 1.0, 3)
             vel[2] *= 0.1 
-            vel = (vel / np.linalg.norm(vel)) * np.random.uniform(1.5, 2) # 速度较快
-            radius = np.random.uniform(0.2, 0.4) # 🌟 尺寸缩小：0.2-0.4m 半径的小鱼
-
+            vel = (vel / np.linalg.norm(vel)) * np.random.uniform(1.5, 2)
+            radius = np.random.uniform(0.2, 0.4) 
             self.dynamic_obs.append({'pos': pos, 'vel': vel, 'radius': radius})
-
     def _update_dynamic_obstacles(self):
         dt = 1.0 / 30.0 
         current_rov_pos = np.array(self.current_obs_dict["LocationSensor"])
@@ -285,51 +236,37 @@ class ROVP2PDynamicWrapper(gym.Env):
 
         return ranges
 
+    # ... [此处原样保留 _update_dynamic_obstacles, _get_simulated_sonar] ...
+    # (为了节省版面，你可以直接把这几个函数原封不动粘进来)
+
     def reset(self, seed=None, options=None):
         self.current_step = 0
         self.previous_action = np.zeros(6) 
         
-        # 🌟 架构升级：适配 DE 算法的密集航点追踪
-        # 假设 DE 规划的航点间隔在 3 到 8 米之间，我们就只在这个范围内训练！
-        # ROV 出生在 [0, 0, -5.0]，我们在它周围随机刷出近距离目标
-        
-        # 先生成一个 3到 4米的随机距离
-        target_dist = np.random.uniform(5.0, 8.0)
-        
-        # 随机生成一个水平方向的角度 (0 到 2pi)
+        # 🌟 动态读取距离靶场范围
+        target_dist = np.random.uniform(self.target_dist_range[0], self.target_dist_range[1])
         angle = np.random.uniform(0, 2 * np.pi)
-        
-        # 随机生成一个深度差异 
-        dz = np.random.uniform(-15.0, -2.0)
+        dz = np.random.uniform(self.dz_range[0], self.dz_range[1])
         
         self.target_pos = np.array([
-            target_dist * np.cos(angle),          # X 坐标
-            target_dist * np.sin(angle),          # Y 坐标
-            dz                                    # Z 坐标 (保证在水下安全范围内)
+            target_dist * np.cos(angle),          
+            target_dist * np.sin(angle),          
+            dz                                    
         ])
         
         self.ocean_sim.reset()
         obs_dict = self.holo_env.reset()
         self.current_obs_dict = obs_dict
 
-        # ==========================================
-        # 🌟 救命修复：初始化 previous_yaw，防止第一步崩溃！
         _, _, yaw_init = np.deg2rad(obs_dict["RotationSensor"])
         self.previous_yaw = yaw_init
-        # ==========================================
         
         initial_pos = np.array(obs_dict["LocationSensor"])
         self.previous_distance = np.linalg.norm(self.target_pos - initial_pos)
         
         self._generate_dynamic_obstacles()
-        
-        # try:
-        #     self.holo_env.draw_box(center=self.target_pos.tolist(), extent=[0.5]*3, color=[255, 0, 0], lifetime=0)
-        #     self.holo_env.draw_line(start=initial_pos.tolist(), end=self.target_pos.tolist(), color=[0, 255, 0], lifetime=0)
-        # except Exception: pass 
-            
         return self._get_obs(obs_dict), {}
-
+    
     def step(self, action):
         self.current_step += 1
         self._update_dynamic_obstacles()
@@ -641,46 +578,3 @@ class ROVP2PDynamicWrapper(gym.Env):
         
         # 严格控制数据类型为 float32，对接 ONNX 模型
         return state.astype(np.float32)
-
-
-# ==========================================
-# 3. 训练启动入口 (第二阶段：长距离续航微调)
-# ==========================================
-if __name__ == "__main__":
-    print("🌟 正在初始化 [Headless 无头模式] 的长距离续航微调环境...")
-    env = ROVP2PDynamicWrapper(rov_config)
-    
-    # 🌟 精算师介入：动态修改超参数以对抗高方差
-    custom_objects = {
-        "learning_rate": 5e-5,  # 降息：从 1e-4 降至 5e-5，保护 V1 肌肉记忆，平滑吸收长距离经验
-        "batch_size": 1024,     # 扩容：批次翻倍，压制长距离航行带来的梯度震荡
-        "buffer_size": 500000   # 确保新经验池依然有足够的容量
-    }
-    
-    print("🧠 正在加载 V1 基础模型，并注入防震荡超参数...")
-    model = SAC.load(
-        "sac_rov_edge8_no_current_no_fish_small_distance_v1",
-        env=env,
-        custom_objects=custom_objects,
-        tensorboard_log="./rov_tensorboard/"
-    )
-    
-    checkpoint_callback = CheckpointCallback(
-        save_freq=25000, 
-        save_path='./rov_models/',
-        name_prefix='sac_rov_edge8_v2_long_distance' ,
-        save_replay_buffer=True # 依然保持保存经验池的好习惯，以防本阶段意外中断
-    )
-    
-    print("🔥 开启 60 万步长距离拉练微调！")
-    
-    model.learn(
-        total_timesteps=600000, 
-        callback=checkpoint_callback, 
-        tb_log_name="SAC_Edge8_Phase2_LongDistance", 
-        reset_num_timesteps=False 
-    )
-    
-    print("✅ 第二阶段拉练完成，保存巅峰模型...")
-    model.save("sac_rov_edge8_no_current_no_fish_normal_distance_v1")
-    model.save_replay_buffer("sac_rov_v1_replay_buffer")

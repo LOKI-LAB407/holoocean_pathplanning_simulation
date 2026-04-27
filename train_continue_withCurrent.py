@@ -10,12 +10,12 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 # 🌊 工业级 3D 海流孪生模型 (Lamb Vortex + Gaussian Vertical Decay)
 # ==========================================
 class OceanCurrentSimulator:
-    def __init__(self, num_vortices=0, map_size=25.0):
+    def __init__(self, num_vortices=3, map_size=25.0):
         self.num_vortices = num_vortices
         self.map_size = map_size
         
         # 🌟 调整 1：将洋流振幅降至 0.15，对齐 Edge 8 实机的抗流极限 (约 1.2 m/s)
-        self.A = 0
+        self.A = 0.1
         self.omega = 2 * np.pi / (12.4 * 3600) 
         self.phi_0 = 0.0 
         
@@ -68,7 +68,7 @@ class OceanCurrentSimulator:
         raw_vy = c_fy_base * time_factor + global_drift_y
         
         # 2. 🌟 绝对物理安全锁：计算水平总流速并限速
-        MAX_CURRENT = 0.1  # 设定的洋流速度绝对上限 (m/s)
+        MAX_CURRENT = 0.20  # 设定的洋流速度绝对上限 (m/s)
         horiz_speed = np.linalg.norm([raw_vx, raw_vy])
         
         if horiz_speed > MAX_CURRENT:
@@ -174,7 +174,7 @@ class ROVP2PDynamicWrapper(gym.Env):
         self.buoyancy_bias = np.zeros(8)
         self.buoyancy_bias[4:8] = 3.0
 
-        self.ocean_sim = OceanCurrentSimulator(num_vortices=0, map_size=25.0)
+        self.ocean_sim = OceanCurrentSimulator(num_vortices=3, map_size=25.0)
 
         # 🌟 11 射线 3D 全景声呐配置
         self.sonar_max_range = 30.0  
@@ -293,14 +293,14 @@ class ROVP2PDynamicWrapper(gym.Env):
         # 假设 DE 规划的航点间隔在 3 到 8 米之间，我们就只在这个范围内训练！
         # ROV 出生在 [0, 0, -5.0]，我们在它周围随机刷出近距离目标
         
-        # 先生成一个 3到 4米的随机距离
-        target_dist = np.random.uniform(5.0, 8.0)
+        # 先生成一个 15 到 5 米的随机距离
+        target_dist = np.random.uniform(8.0, 12.0)
         
         # 随机生成一个水平方向的角度 (0 到 2pi)
         angle = np.random.uniform(0, 2 * np.pi)
         
         # 随机生成一个深度差异 
-        dz = np.random.uniform(-15.0, -2.0)
+        dz = np.random.uniform(-12.5, -2.0)
         
         self.target_pos = np.array([
             target_dist * np.cos(angle),          # X 坐标
@@ -641,46 +641,30 @@ class ROVP2PDynamicWrapper(gym.Env):
         
         # 严格控制数据类型为 float32，对接 ONNX 模型
         return state.astype(np.float32)
-
-
-# ==========================================
-# 3. 训练启动入口 (第二阶段：长距离续航微调)
-# ==========================================
 if __name__ == "__main__":
-    print("🌟 正在初始化 [Headless 无头模式] 的长距离续航微调环境...")
+    print("🌟 正在初始化 [Phase 2: 浅海微风] 洋流抗流特训环境...")
     env = ROVP2PDynamicWrapper(rov_config)
     
-    # 🌟 精算师介入：动态修改超参数以对抗高方差
-    custom_objects = {
-        "learning_rate": 5e-5,  # 降息：从 1e-4 降至 5e-5，保护 V1 肌肉记忆，平滑吸收长距离经验
-        "batch_size": 1024,     # 扩容：批次翻倍，压制长距离航行带来的梯度震荡
-        "buffer_size": 500000   # 确保新经验池依然有足够的容量
-    }
-    
-    print("🧠 正在加载 V1 基础模型，并注入防震荡超参数...")
-    model = SAC.load(
-        "sac_rov_edge8_no_current_no_fish_small_distance_v1",
-        env=env,
-        custom_objects=custom_objects,
-        tensorboard_log="./rov_tensorboard/"
-    )
+    # 🌟 核心修改点：加载你之前 0.8米 训练毕业的巅峰模型！
+    # 请确保文件名与你上一阶段最后 save() 的名字完全一致
+    print("🧠 正在加载 Phase 1 巅峰模型，准备迎接大自然的挑战...")
+    model = SAC.load("sac_rov_edge8_phase2_ready", env=env, tensorboard_log="./rov_tensorboard/")
     
     checkpoint_callback = CheckpointCallback(
         save_freq=25000, 
         save_path='./rov_models/',
-        name_prefix='sac_rov_edge8_v2_long_distance' ,
-        save_replay_buffer=True # 依然保持保存经验池的好习惯，以防本阶段意外中断
+        name_prefix='sac_rov_edge8_phase2_current03' # 改个新名字防覆盖
     )
     
-    print("🔥 开启 60 万步长距离拉练微调！")
+    print("🔥 开启 Phase 2 微弱洋流抗性特训！")
     
+    # 🌟 继续断点续训，开启新曲线段
     model.learn(
-        total_timesteps=600000, 
+        total_timesteps=300000, 
         callback=checkpoint_callback, 
-        tb_log_name="SAC_Edge8_Phase2_LongDistance", 
+        tb_log_name="SAC_Edge8_Phase2_MildCurrent_03", # 换个新日志名
         reset_num_timesteps=False 
     )
     
-    print("✅ 第二阶段拉练完成，保存巅峰模型...")
-    model.save("sac_rov_edge8_no_current_no_fish_normal_distance_v1")
-    model.save_replay_buffer("sac_rov_v1_replay_buffer")
+    print("✅ 浅海微风抗流特训完成，保存初级抗流模型...")
+    model.save("sac_rov_edge8_phase2_3_ready")

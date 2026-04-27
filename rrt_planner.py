@@ -94,7 +94,12 @@ class RRT3D:
         return dense_path
 
     def plan(self):
-        print("🗺️ 正在生成全局避障路径...")
+        print("🗺️ 正在生成全局避障路径 (带最大俯仰角限制)...")
+        
+        # 🌟 新增：最大下潜俯仰角 (例如 40度)，防止垂直掉落
+        max_pitch_angle = np.deg2rad(40) 
+        max_tan = np.tan(max_pitch_angle)
+
         for _ in range(self.max_iter):
             rand_pos = self.get_random_node()
             
@@ -103,6 +108,14 @@ class RRT3D:
             nearest_node = self.nodes[nearest_idx]
             
             direction = rand_pos - nearest_node['pos']
+            
+            # 🌟 核心修复：盘山公路算法，限制 Z 轴的剧烈变化
+            xy_len = np.linalg.norm(direction[:2])
+            z_len = direction[2]
+            if abs(z_len) > xy_len * max_tan:
+                # 强行把 Z 轴压平，让它斜着走
+                direction[2] = np.sign(z_len) * xy_len * max_tan
+                
             length = np.linalg.norm(direction)
             if length == 0: continue
             direction = direction / length
@@ -115,10 +128,9 @@ class RRT3D:
                 if np.linalg.norm(new_pos - self.goal) < self.step_size:
                     self.nodes.append({'pos': self.goal, 'parent': len(self.nodes) - 1})
                     
-                    raw_path = self.extract_path()           # 1. 提取原始锯齿线
-                    pruned_path = self.prune_path(raw_path)  # 2. 剪枝成大折线
-                    final_path = self.densify_path(pruned_path) # 3. 致密化成面包屑轨迹
-                    
+                    raw_path = self.extract_path()           
+                    pruned_path = self.prune_path(raw_path)  
+                    final_path = self.densify_path(pruned_path) 
                     return final_path
                     
         print("❌ RRT 规划失败：未能在最大迭代次数内找到路径。")
