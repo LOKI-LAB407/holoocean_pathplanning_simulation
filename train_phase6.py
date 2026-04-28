@@ -4,7 +4,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 from rov_env import ROVP2PDynamicWrapper, rov_config
 
 if __name__ == "__main__":
-    print("🌟 正在初始化 [Phase 5: 洋流抗流] 训练环境...")
+    print("🌟 正在初始化 [Phase 6: 避障训练] 训练环境...")
     
     # 🌟 绝对对齐的配置字典！
     phase5_curriculum = {
@@ -23,37 +23,32 @@ if __name__ == "__main__":
         "batch_size": 1024,
         "buffer_size": 500000 
     }
-    model_path = f"./rov_models/sac_rov_edge8_phase5_current070_1875000_steps.zip"
-    buffer_path = f"./rov_models/sac_rov_edge8_phase5_current070_replay_buffer_1875000_steps.pkl"
     
     # 请确保这里的字符串是你真实要加载的模型名
-    print("🧠 正在加载 Phase 5 巅峰模型，准备迎接洋流洗礼...")
+    print("🧠 正在加载 Phase 6 巅峰模型，准备迎接洋流洗礼...")
     model = SAC.load(
-        model_path, 
+        "sac_rov_edge8_mild_current_no_fish_normal_dis", 
         env=env,
         custom_objects=custom_objects,
         tensorboard_log="./rov_tensorboard/"
     )
-    print(f"📦 正在导入断点经验包 (读取几十万条数据可能需要一些时间和内存): {buffer_path} ...")
-    model.load_replay_buffer(buffer_path)
-    # ===================================================================================
-
+    
     checkpoint_callback = CheckpointCallback(
         save_freq=25000, 
         save_path='./rov_models/',
-        name_prefix='sac_rov_edge8_phase5_resume',
+        name_prefix='sac_rov_edge8_phase6_fish01',
         save_replay_buffer=True # 保留保存账本的好习惯
     )
     
-    print("🔥 开启 Phase 5 深海抗流训练 (25万步)！")
+    print("🔥 开启 Phase 6 深海抗流训练 (80万步)！")
     
     model.learn(
-        total_timesteps=250000, 
+        total_timesteps=800000, 
         callback=checkpoint_callback, 
-        tb_log_name="SAC_Edge8_Phase5_ExtremeCurrent_07", 
+        tb_log_name="SAC_Edge8_Phase6_Avoid_Fish_01", 
         reset_num_timesteps=False 
     )
     
-    print("✅ Phase 5 训练完成，保存最新抗流模型...")
-    model.save("sac_rov_edge8_phase5_ready")
-    model.save_replay_buffer("sac_rov_phase5_replay_buffer")
+    print("✅ Phase 6 训练完成，保存最新抗流模型...")
+    model.save("sac_rov_edge8_phase6_ready")
+    model.save_replay_buffer("sac_rov_phase6_replay_buffer")

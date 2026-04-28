@@ -32,9 +32,9 @@ class OceanCurrentSimulator:
             ## 漩涡的深度强度
             sigma_z = np.random.uniform(3.0, 15.0) 
             ## 漩涡水平强度 以及旋转方向
-            eta = np.random.choice([1, -1]) * np.random.uniform(3.0, 8.0) 
+            eta = np.random.choice([1, -1]) * np.random.uniform(30.0, 60.0) 
             ## 漩涡半径
-            xi = np.random.uniform(4.0, 10.0) 
+            xi = np.random.uniform(5.0, 10.0) 
             self.vortices.append({'x0': x0, 'y0': y0, 'z0': z0, 'eta': eta, 'xi': xi, 'sigma_z': sigma_z})
 
     def get_current_velocity(self, x, y, z, t):
@@ -347,7 +347,7 @@ class ROVP2PDynamicWrapper(gym.Env):
         self.previous_distance = distance_to_target
 
 
-        ## 生存税
+        ## 生存税（速度达到0.1875m/s才能抵扣生存税）
         reward -= 0.25
 
         # 🌟 核心防挂机考核：基于真实物理速度 (0.2m/s ~ 1.0m/s) 的线性门控
@@ -355,9 +355,9 @@ class ROVP2PDynamicWrapper(gym.Env):
         closing_speed = max(progress, 0) * 30.0
         
         # 线性插值精算：
-        # - 速度 <= 0.2 m/s：乘数为 0 (彻底掐断低速摸鱼赚姿态分的可能)
+        # - 速度 <= 0.1 m/s：乘数为 0 (彻底掐断低速摸鱼赚姿态分的可能)
         # - 速度 >= 1.0 m/s：乘数为 1.0 (全速巡航，拿满所有绩效)
-        # - 速度在 0.2 ~ 1.0 之间：平滑线性增长
+        # - 速度在 0.1 ~ 1.0 之间：平滑线性增长
         moving_multiplier = np.clip((closing_speed - 0.1) / (1.0 - 0.1), 0.0, 1.0)
 
         
@@ -374,8 +374,8 @@ class ROVP2PDynamicWrapper(gym.Env):
 
         # 区分"无目的摇头"和"紧急规避转向"
         # 动态计算转向惩罚系数，在 1.2m 到 4.0m 之间平滑过渡 (0.2 到 1.5)
-        yaw_penalty_factor = np.clip(1.5 - 1.3 * (4.0 - min_sonar_dist) / (4.0 - 1.0), 0.2, 1.5)
-        reward -= yaw_change * yaw_penalty_factor
+        # yaw_penalty_factor = np.clip(1.5 - 1.3 * (4.0 - min_sonar_dist) / (4.0 - 1.0), 0.2, 1.5)
+        # reward -= yaw_change * yaw_penalty_factor
 
         self.previous_yaw = yaw_new
         
@@ -394,56 +394,36 @@ class ROVP2PDynamicWrapper(gym.Env):
         raw_barrier = 1e-8 * (np.exp(0.4 * tilt_deg) - 1.0)
         barrier_penalty = np.clip(raw_barrier, 0.0, 100.0)
         reward -= barrier_penalty
-        # if tilt_deg > 40.0:
-        #     reward -= (tilt_deg - 40.0) * 0.2
 
-     
-        # # ## 4. 速度惩罚
-        # # 根据声呐最近距离动态限制速度
-        # safe_speed = np.clip(min_sonar_dist / 2.5, 0.3, 1.5)  # 障碍越近，允许速度越低
-        # if speed > safe_speed:
-        #     reward -= (speed - safe_speed) * 8.0
         
-        ## 5. 🌟 释放性能封印 (极低的动力惩罚，鼓励敢于满功率抗流)
-        # horizontal_effort = action[0]**2 + action[1]**2
-        # vertical_effort = action[2]**2 + action[3]**2 + action[4]**2
-        # yaw_effort = action[5]**2 
-        # 惩罚降到极低，让 ROV 放开手脚对抗大自然
-        # reward -= (horizontal_effort * 0.002 + vertical_effort * 0.001 + yaw_effort * 0.01)
-        # 动作平滑惩罚大幅降低，允许快速机动
+        ## 4. 🌟 释放性能封印 (极低的动力惩罚，鼓励敢于满功率抗流)
         reward -= np.sum(np.square(action - self.previous_action)) * 0.04
         self.previous_action = np.copy(action)
         
-        ## 6. 声呐障碍物软惩罚
+        ## 5. 声呐障碍物软惩罚
         ## 替换原来的软惩罚
         # 🌟 柔化声呐惩罚
         safe_dist = 4.0
-        danger_dist = 1.0  
-        max_soft_penalty = 1.5 # 降低软惩罚的极值，鼓励它大胆靠近
+        # 1. 统一危险系数 (0.0 -> 1.0 绝对线性映射)
+        danger_ratio = np.clip((safe_dist - min_sonar_dist) / safe_dist, 0.0, 1.0)
 
-        if min_sonar_dist < danger_dist:
-            # 即使进入 1.0m，惩罚也不要那么狂暴，给鱼逃跑的时间
-            reward -= max_soft_penalty + 5.0 * (danger_dist - min_sonar_dist) / danger_dist
-        elif min_sonar_dist < safe_dist:
-            danger_ratio = (safe_dist - min_sonar_dist) / (safe_dist - danger_dist)
-            reward -= max_soft_penalty * (danger_ratio ** 2)
-            
-        # 🌟 新策略：减速等待，小角度绕行
-        # 当遇到动态障碍物 (距离较近) 时，考核其是否进行了减速
-        if min_sonar_dist < safe_dist: 
-            safe_speed_limit = np.clip(min_sonar_dist * 0.4, 0.3, 1.5)
-            
-            # 构建一个边界平滑衰减系数
-            # 距离 4.0m 时系数为 0，距离 1.0m 时系数为 1。完美实现平滑过渡
-            zone_ratio = np.clip((safe_dist - min_sonar_dist) / (safe_dist - danger_dist), 0.0, 1.0)
+        # 2. 距离排斥力：三次幂曲线 (Cubic Repulsion)
+        reward -= 8.0 * (danger_ratio ** 3)
 
-            # 修复：完全删除 speed_yield_ratio 的正奖励部分
-            # 超速才罚，低速不给奖，让进度奖励来驱动移动
+        # 3. 🛡️ 动态限速 (加上了你完美的安全锁)
+        if min_sonar_dist < safe_dist:
+            # 安全速度限额随距离线性递减 (4m外限速1.4m/s，贴脸限速无限趋近0m/s)
+            safe_speed_limit = min_sonar_dist * 0.35 
+            
             if speed > safe_speed_limit:
-                reward -= (speed - safe_speed_limit) * 12.0 * zone_ratio
+                # 越界越多，罚得越惨。距离越近，极限越低，超速惩罚越大！
+                reward -= 15.0 * ((speed - safe_speed_limit) ** 2)
+        # 4. 转向豁免权联动
+        yaw_penalty_factor = 1.5 - 1.75 * danger_ratio
+        reward -= yaw_change * yaw_penalty_factor
 
 
-        # 修复：在奖励函数中增加软边界惩罚
+        #6 修复：在奖励函数中增加软边界惩罚
         # 接近水面/水底时给予渐进惩罚
         # 在每步奖励计算中加入
         current_z = current_pos[2]

@@ -8,32 +8,40 @@ import holoocean
 from stable_baselines3 import SAC 
 
 # ==========================================
-# 🌊 1. 3D 洋流模型 (匹配 Phase 4：微弱洋流抗流测试)
+# 🌊 1. 3D 洋流模型 
 # ==========================================
 class OceanCurrentSimulator:
-    def __init__(self, num_vortices=4, map_size=25.0, max_current=0.35, amplitude=0.1):
+    def __init__(self, num_vortices=6, map_size=25.0, max_current=35, amplitude=0.0):
         self.num_vortices = num_vortices
         self.map_size = map_size
-        
-        # 🌟 调整：接收外部传入的振幅与极速，对齐 Phase 3 训练参数
         self.max_current = max_current
+        
+        # 🌟 修复1：强制关闭潮汐随机波动，锁定最高倍率的死亡水流
         self.A = amplitude
-        self.omega = 2 * np.pi / (12.4 * 3600) 
-        self.phi_0 = 0.0 
+        self.omega = 0.0 
+        self.phi_0 = np.pi / 2  # 锁定 sin(90度) = 1，让 time_factor 永远满载
         
         self.vortices = []
         
     def reset(self):
         self.vortices = []
-        self.phi_0 = np.random.uniform(0, 2 * np.pi) 
         
-        for _ in range(self.num_vortices):
-            x0 = np.random.uniform(-self.map_size, self.map_size)
-            y0 = np.random.uniform(-self.map_size, self.map_size)
-            z0 = np.random.uniform(-35.0, -2.0) 
-            sigma_z = np.random.uniform(3.0, 15.0) 
-            eta = np.random.choice([1, -1]) * np.random.uniform(3.0, 8.0) 
-            xi = np.random.uniform(4.0, 10.0) 
+        # 🌟 修复2：定向打击！在它的必经之路 [6, 6] 正中央放一个巨型漩涡
+        self.vortices.append({
+            'x0': 6.0, 'y0': 6.0, 'z0': -8.0, 
+            'eta': 35.0,        # 极度狂暴的旋转力矩
+            'xi': 8.0, 
+            'sigma_z': 15.0
+        })
+        
+        # 其余的漩涡也强制缩拢在航线附近 (0 到 15 米区域)
+        for _ in range(self.num_vortices - 1):
+            x0 = np.random.uniform(0.0, 15.0)
+            y0 = np.random.uniform(0.0, 15.0)
+            z0 = np.random.uniform(-15.0, -2.0) 
+            sigma_z = np.random.uniform(5.0, 15.0) 
+            eta = np.random.choice([1, -1]) * np.random.uniform(15.0, 20.0) 
+            xi = np.random.uniform(5.0, 10.0) 
             
             self.vortices.append({
                 'x0': x0, 'y0': y0, 'z0': z0, 
@@ -142,12 +150,12 @@ class ROVFullTestWrapper(gym.Env):
         
         self.num_sonar_rays = len(self.sonar_ray_dirs)
         self.clean_sonar_ranges = np.ones(self.num_sonar_rays) * self.sonar_max_range
-        # 🌟 核心修改：统一且精准的 Phase 3 物理引擎注入
+        # 🌟 核心修改
         self.ocean_sim = OceanCurrentSimulator(
-            num_vortices=3,       # 3 个涡旋
+            num_vortices=6,       
             map_size=25.0, 
-            max_current=0.1,      # 0.1 m/s 的绝对极速
-            amplitude=0.1         # 潮汐振幅开启
+            max_current=35,    # 3.5m/s 将产生 245N~250N 的阻力，几乎榨干推进器
+            amplitude=0.0       # 关掉振幅随机
         )
 
     def reset_for_test(self, start_pos, final_target):
@@ -280,7 +288,7 @@ if __name__ == "__main__":
     
     # 🌟 加载你刚刚用 30万步 锐化后的极限 0.8 米模型！
     print("🧠 正在加载 0.8米 极限特训后的巅峰模型...")
-    model = SAC.load("sac_rov_edge8_mild_current_no_fish_normal_dis.zip") 
+    model = SAC.load("sac_rov_edge8_extreme_current_no_fish_normal_dis.zip") 
     # print(model.policy)
     # 物理账本完全对齐训练环境
     START = np.array([0.0, 0.0, -5.0])  
