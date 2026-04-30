@@ -11,7 +11,7 @@ from stable_baselines3 import SAC
 # 🌊 1. 3D 洋流模型 
 # ==========================================
 class OceanCurrentSimulator:
-    def __init__(self, num_vortices=6, map_size=25.0, max_current=35, amplitude=0.0):
+    def __init__(self, num_vortices=6, map_size=25.0, max_current=1, amplitude=0.0):
         self.num_vortices = num_vortices
         self.map_size = map_size
         self.max_current = max_current
@@ -30,7 +30,7 @@ class OceanCurrentSimulator:
         self.vortices.append({
             'x0': 6.0, 'y0': 6.0, 'z0': -8.0, 
             'eta': 35.0,        # 极度狂暴的旋转力矩
-            'xi': 8.0, 
+            'xi': 5.0, 
             'sigma_z': 15.0
         })
         

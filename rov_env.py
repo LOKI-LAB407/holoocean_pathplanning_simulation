@@ -114,6 +114,7 @@ class ROVP2PDynamicWrapper(gym.Env):
         self.num_vortices = curriculum_config.get("num_vortices", 0)
         self.max_current = curriculum_config.get("max_current", 0.0)
         self.num_dynamic_obs = curriculum_config.get("num_dynamic_obs", 0)
+        self.is_static_obs = curriculum_config.get("is_static_obs", False)
         self.amplitude = curriculum_config.get("amplitude", 0.0)
 
         self.holo_env = holoocean.make(scenario_cfg=config, show_viewport=False)
@@ -161,18 +162,62 @@ class ROVP2PDynamicWrapper(gym.Env):
 
     def _generate_dynamic_obstacles(self):
         self.dynamic_obs = []
-        # 🌟 动态读取障碍物数量
+        
+        # 🌟 1. 获取 ROV 真实的起步坐标 (例如 [0.0, 0.0, -5.0])
+        initial_pos = np.array(self.current_obs_dict["LocationSensor"])
+        
+        # 🌟 2. 计算从 ROV 指向目标点的 3D 向量路径
+        path_vector = self.target_pos - initial_pos
+        
         for _ in range(self.num_dynamic_obs):
-            pos = self.target_pos * np.random.uniform(0.2, 0.8) 
-            pos += np.random.uniform(-8.0, 8.0, 3) 
+            # 🌟 3. 矢量插值：水雷严丝合缝地生成在这条直线的 20% ~ 80% 处
+            k = np.random.uniform(0.2, 0.8)
+            base_pos = initial_pos + path_vector * k
+            
+            # 🌟 4. 极限收紧的“铁桶阵”散布
+            # 在 5~8 米的距离内，偏差超过 1.5 米 ROV 就可以轻松绕过了。
+            # 我们把它收紧到 [-1.0, 1.0]，逼迫它必须紧贴着水雷擦过去！
+            jitter = np.array([
+                np.random.uniform(-1.0, 1.0), # X 轴偏移
+                np.random.uniform(-1.0, 1.0), # Y 轴偏移
+                np.random.uniform(-0.8, 0.8)  # Z 轴偏移更严格，防止鱼飞出水面
+            ])
+            
+            pos = base_pos + jitter
+            
+            # 兜底：防止刷在水面或海底之外
             pos[2] = np.clip(pos[2], self.water_bottom_z + 2, self.water_surface_z - 2)
             
-            vel = np.random.uniform(-1.0, 1.0, 3)
-            vel[2] *= 0.1 
-            vel = (vel / np.linalg.norm(vel)) * np.random.uniform(1.5, 2)
+            # 静态/动态速度判定
+            if getattr(self, 'is_static_obs', False):
+                vel = np.zeros(3)
+            else:
+                vel = np.random.uniform(-1.0, 1.0, 3)
+                vel[2] *= 0.1 
+                vel = (vel / np.linalg.norm(vel)) * np.random.uniform(1.5, 2)
+                
             radius = np.random.uniform(0.2, 0.4) 
             self.dynamic_obs.append({'pos': pos, 'vel': vel, 'radius': radius})
+
+    # def _generate_dynamic_obstacles(self):
+    #     self.dynamic_obs = []
+    #     # 🌟 动态读取障碍物数量
+    #     for _ in range(self.num_dynamic_obs):
+    #         pos = self.target_pos * np.random.uniform(0.2, 0.8) 
+    #         pos += np.random.uniform(-8.0, 8.0, 3) 
+    #         pos[2] = np.clip(pos[2], self.water_bottom_z + 2, self.water_surface_z - 2)
+            
+    #         vel = np.random.uniform(-1.0, 1.0, 3)
+    #         vel[2] *= 0.1 
+    #         vel = (vel / np.linalg.norm(vel)) * np.random.uniform(1.5, 2)
+    #         radius = np.random.uniform(0.2, 0.4) 
+    #         self.dynamic_obs.append({'pos': pos, 'vel': vel, 'radius': radius})
+
     def _update_dynamic_obstacles(self):
+        # 🌟 如果是静态障碍物，直接短路返回，不进行任何位置更新
+        if getattr(self, 'is_static_obs', False):
+            return
+
         dt = 1.0 / 30.0 
         current_rov_pos = np.array(self.current_obs_dict["LocationSensor"])
   
@@ -419,7 +464,7 @@ class ROVP2PDynamicWrapper(gym.Env):
                 # 越界越多，罚得越惨。距离越近，极限越低，超速惩罚越大！
                 reward -= 15.0 * ((speed - safe_speed_limit) ** 2)
         # 4. 转向豁免权联动
-        yaw_penalty_factor = 1.5 - 1.75 * danger_ratio
+        yaw_penalty_factor = 1.5 - 2.5 * danger_ratio
         reward -= yaw_change * yaw_penalty_factor
 
 
@@ -445,7 +490,7 @@ class ROVP2PDynamicWrapper(gym.Env):
         if self.current_step > 10: 
             rov_radius = 0.6 
             # 死亡的真实代价 = 基础罚款 + 把没交完的税一次性交齐！
-            death_penalty = 1000
+            death_penalty = 600
 
             # 鱼碰撞改为终止，消除无限叠加
             is_fish_crashed = False

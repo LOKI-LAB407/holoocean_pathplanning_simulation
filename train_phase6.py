@@ -7,16 +7,17 @@ if __name__ == "__main__":
     print("🌟 正在初始化 [Phase 6: 避障训练] 训练环境...")
     
     # 🌟 绝对对齐的配置字典！
-    phase5_curriculum = {
+    phase6_curriculum = {
         "target_dist_range": (5.0, 8.0), # 对齐 8~5米
         "dz_range": (-15.0, -2.0),        # 对齐深度
         "num_vortices": 3,                # 对齐 3 个涡旋
-        "max_current": 0.70,              # 对齐 0.70 m/s 极速(约为1.5节)
-        "amplitude": 0.1,                 # 🌟 对齐潮汐振幅，极其关键！
-        "num_dynamic_obs": 0              
+        "max_current": 0.4,              # 对齐 0.40 m/s 极速(约为1.5节)
+        "num_dynamic_obs": 3,
+        "is_static_obs": True,           # 🌟 加入静态障碍物，增加避障难度
+        "amplitude": 0.1                 # 🌟 对齐潮汐振幅，极其关键！            
     }
     
-    env = ROVP2PDynamicWrapper(rov_config, curriculum_config=phase5_curriculum)
+    env = ROVP2PDynamicWrapper(rov_config, curriculum_config=phase6_curriculum)
     
     custom_objects = {
         "learning_rate": 8e-5,  
@@ -24,14 +25,22 @@ if __name__ == "__main__":
         "buffer_size": 500000 
     }
     
+    
+    model_path = "sac_rov_edge8_phase6_fish01_3275000_steps.zip"
+    buffer_path= "sac_rov_edge8_phase6_fish01_replay_buffer_3275000_steps.pkl"
+
     # 请确保这里的字符串是你真实要加载的模型名
     print("🧠 正在加载 Phase 6 巅峰模型，准备迎接洋流洗礼...")
     model = SAC.load(
-        "sac_rov_edge8_mild_current_no_fish_normal_dis", 
+        model_path, 
         env=env,
         custom_objects=custom_objects,
         tensorboard_log="./rov_tensorboard/"
     )
+
+    print(f"📦 正在导入断点经验包 (读取几十万条数据可能需要一些时间和内存): {buffer_path} ...")
+    model.load_replay_buffer(buffer_path)
+    # ===================================================================================
     
     checkpoint_callback = CheckpointCallback(
         save_freq=25000, 
@@ -40,10 +49,10 @@ if __name__ == "__main__":
         save_replay_buffer=True # 保留保存账本的好习惯
     )
     
-    print("🔥 开启 Phase 6 深海抗流训练 (80万步)！")
+    print("🔥 开启 Phase 6 深海避障训练 (40万步)！")
     
     model.learn(
-        total_timesteps=800000, 
+        total_timesteps=400000, 
         callback=checkpoint_callback, 
         tb_log_name="SAC_Edge8_Phase6_Avoid_Fish_01", 
         reset_num_timesteps=False 
