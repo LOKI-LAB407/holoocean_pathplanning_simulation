@@ -9,7 +9,7 @@ if __name__ == "__main__":
     # 🌟 绝对对齐的配置字典！
     phase6_curriculum = {
         "target_dist_range": (8.0, 10.0), # 对齐 8~10米
-        "dz_range": (-12.0, -2.0),        # 对齐深度
+        "dz_range": (-10.0, -2.0),        # 对齐深度
         "num_vortices": 3,                # 对齐 3 个涡旋
         "max_current": 0.4,              # 对齐 0.40 m/s 极速(约为1.5节)
         "num_dynamic_obs": 4,

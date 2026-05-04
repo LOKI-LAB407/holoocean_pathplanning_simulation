@@ -91,7 +91,7 @@ rov_config = {
         "agent_name": "my_rov",
         "agent_type": "HoveringAUV",
         "control_scheme": 0, 
-        "location": [0.0, 0.0, -7.0], 
+        "location": [0.0, 0.0, -6.0], 
         "sensors": [
             {"sensor_type": "LocationSensor"}, 
             {"sensor_type": "VelocitySensor"}, 
