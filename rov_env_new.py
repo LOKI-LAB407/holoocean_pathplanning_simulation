@@ -91,7 +91,7 @@ rov_config = {
         "agent_name": "my_rov",
         "agent_type": "HoveringAUV",
         "control_scheme": 0, 
-        "location": [0.0, 0.0, -5.0], 
+        "location": [0.0, 0.0, -7.0], 
         "sensors": [
             {"sensor_type": "LocationSensor"}, 
             {"sensor_type": "VelocitySensor"}, 
@@ -109,7 +109,7 @@ class ROVP2PDynamicWrapper(gym.Env):
         # 解析难度配置（如果没有传入，则提供默认的安全兜底配置）
         if curriculum_config is None:
             curriculum_config = {}
-        self.target_dist_range = curriculum_config.get("target_dist_range", (5.0, 8.0))
+        self.target_dist_range = curriculum_config.get("target_dist_range", (8.0, 10.0))
         self.dz_range = curriculum_config.get("dz_range", (-15.0, -2.0))
         self.num_vortices = curriculum_config.get("num_vortices", 0)
         self.max_current = curriculum_config.get("max_current", 0.0)
@@ -120,7 +120,7 @@ class ROVP2PDynamicWrapper(gym.Env):
         # self.holo_env = holoocean.make(scenario_cfg=config, show_viewport=False)
         self.holo_env = holoocean.make(
             scenario_cfg=config, 
-            show_viewport=False
+            show_viewport=False 
         )
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(25,), dtype=np.float32)
@@ -208,8 +208,8 @@ class ROVP2PDynamicWrapper(gym.Env):
             sign_y = np.random.choice([-1, 1])
             
             jitter_far = np.array([
-                sign_x * np.random.uniform(4.0, 8.0), # 偏离航线 4 到 8 米
-                sign_y * np.random.uniform(4.0, 8.0), # 偏离航线 4 到 8 米
+                sign_x * np.random.uniform(1.5, 2.5), # 偏离航线 4 到 8 米
+                sign_y * np.random.uniform(1.5, 2.5), # 偏离航线 4 到 8 米
                 np.random.uniform(-3.0, 3.0)          # 高度稍微错开
             ])
             pos_far = base_pos_far + jitter_far
@@ -414,6 +414,31 @@ class ROVP2PDynamicWrapper(gym.Env):
         # - 速度在 0.1 ~ 1.0 之间：平滑线性增长
         moving_multiplier = np.clip((closing_speed - 0.1) / (1.0 - 0.1), 0.0, 1.0)
 
+        # ========================================
+        # 🌟 新增：速度-目标指向一致性奖励 (铁腕防绕路)
+        # ========================================
+        v_world = np.array(self.current_obs_dict["VelocitySensor"])
+        speed_world = np.linalg.norm(v_world)
+        vec_to_target = self.target_pos - current_pos
+        
+        # 只有在产生有效物理速度时才进行判定，避免原地打转时的分母为 0 或误判
+        if speed_world > 0.1 and distance_to_target > 0.1:
+            # 向量点乘公式计算 cos(theta)
+            raw_cos = np.dot(v_world, vec_to_target) / (speed_world * distance_to_target)
+            cos_theta = np.clip(raw_cos, -1.0, 1.0)
+            
+            # 🌟 核心调整：将临界角收紧至 30 度 (cos(30°) ≈ 0.866)
+            critical_cos = 0.866 
+            
+            if cos_theta > critical_cos:
+                # 合法微操或直行：角度越小 (cos越接近1)，奖励越高
+                alignment_bonus = (cos_theta - critical_cos) / (1.0 - critical_cos)
+                reward += alignment_bonus * 2.5 * moving_multiplier
+            else:
+                # 判定为绕远路：偏离超过 30 度，采用二次方惩罚
+                detour_penalty = ((critical_cos - cos_theta) ** 2) * 10.0
+                reward -= detour_penalty * moving_multiplier
+
         
         ## 2. 🌟 铁腕航向对齐 (防挂机版)
         yaw_error_deg_abs = abs(np.rad2deg(yaw_error))
@@ -453,7 +478,7 @@ class ROVP2PDynamicWrapper(gym.Env):
         ## 5. 声呐障碍物软惩罚
         ## 替换原来的软惩罚
         # 🌟 柔化声呐惩罚
-        safe_dist = 2.5
+        safe_dist = 3.0  # 安全距离阈值，3米内开始逐渐增加惩罚
         # 1. 统一危险系数 (0.0 -> 1.0 绝对线性映射)
         danger_ratio = np.clip((safe_dist - min_sonar_dist) / safe_dist, 0.0, 1.0)
 
@@ -463,7 +488,7 @@ class ROVP2PDynamicWrapper(gym.Env):
         # 3. 🛡️ 动态限速 (加上了你完美的安全锁)
         if min_sonar_dist < safe_dist:
             # 安全速度限额随距离线性递减 (4m外限速1.4m/s，贴脸限速无限趋近0m/s)
-            safe_speed_limit = min_sonar_dist * 0.7 
+            safe_speed_limit = min_sonar_dist * 0.5 
             
             if speed > safe_speed_limit:
                 # 越界越多，罚得越惨。距离越近，极限越低，超速惩罚越大！
