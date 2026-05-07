@@ -117,3 +117,45 @@ action[4] (Pitch / 前后俯仰)：驱动 M5~M8。
 
 action[5] (Yaw / 左右偏航)：驱动 M1~M4。
 
+###################################################################################
+自动化流水线指令 (run_pipeline.py)
+###################################################################################
+
+# 完整流程：训练30万步 → 测试（弹窗口）
+& D:/miniconda3/envs/hololab/python.exe d:/holoocean_sim/run_pipeline.py
+
+# 训练10万步 → 测试
+& D:/miniconda3/envs/hololab/python.exe d:/holoocean_sim/run_pipeline.py --timesteps 100000
+
+# 跳过训练，只测试已有模型（弹窗口）
+& D:/miniconda3/envs/hololab/python.exe d:/holoocean_sim/run_pipeline.py --skip-training --model sac_rov_edge8_phase6_fish01_2925000_steps
+
+# 跳过训练，只测试 + 无头模式（不弹窗口，只出视频）
+& D:/miniconda3/envs/hololab/python.exe d:/holoocean_sim/run_pipeline.py --skip-training --model sac_rov_edge8_phase6_fish01_2925000_steps --headless
+
+# 训练后无头测试
+& D:/miniconda3/envs/hololab/python.exe d:/holoocean_sim/run_pipeline.py --headless
+
+# 指定视频输出路径
+& D:/miniconda3/envs/hololab/python.exe d:/holoocean_sim/run_pipeline.py --video d:/holoocean_sim/results/test.avi
+
+###################################################################################
+单独测试指令 (test_and_record.py)
+###################################################################################
+
+# 默认模型，弹窗口
+& D:/miniconda3/envs/hololab/python.exe d:/holoocean_sim/test_and_record.py
+
+# 指定模型 + 无头
+& D:/miniconda3/envs/hololab/python.exe d:/holoocean_sim/test_and_record.py --model sac_rov_edge8_phase6_fish01_2925000_steps --headless
+
+# 指定模型 + 指定视频路径
+& D:/miniconda3/envs/hololab/python.exe d:/holoocean_sim/test_and_record.py --model sac_rov_edge8_phase6_ready --video d:/holoocean_sim/results/phase6_final.avi
+
+###################################################################################
+单独训练指令 (train_phase6_new.py)
+###################################################################################
+
+# 默认30万步
+& D:/miniconda3/envs/hololab/python.exe d:/holoocean_sim/train_phase6_new.py
+

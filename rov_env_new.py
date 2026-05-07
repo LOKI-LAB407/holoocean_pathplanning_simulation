@@ -116,6 +116,7 @@ class ROVP2PDynamicWrapper(gym.Env):
         self.num_dynamic_obs = curriculum_config.get("num_dynamic_obs", 0)
         self.is_static_obs = curriculum_config.get("is_static_obs", False)
         self.amplitude = curriculum_config.get("amplitude", 0.0)
+        self.obstacle_layout = curriculum_config.get("obstacle_layout", "default")
 
         # self.holo_env = holoocean.make(scenario_cfg=config, show_viewport=False)
         self.holo_env = holoocean.make(
@@ -128,7 +129,7 @@ class ROVP2PDynamicWrapper(gym.Env):
         self.tam_inverse = get_rov_mixing_matrix()
         self.max_steps = 2000  
         self.current_step = 0
-        self.max_tilt_rad = 1.0        
+        self.max_tilt_rad = 1.5        
         self.water_surface_z = -0.5    
         self.water_bottom_z = -40.0    
         
@@ -166,60 +167,68 @@ class ROVP2PDynamicWrapper(gym.Env):
 
     def _generate_dynamic_obstacles(self):
         self.dynamic_obs = []
-        
-        # 1. 获取起止点信息，计算航线向量
         initial_pos = np.array(self.current_obs_dict["LocationSensor"])
         path_vector = self.target_pos - initial_pos
-        
+
         if self.num_dynamic_obs <= 0:
             return
 
+        if self.obstacle_layout == "phase7":
+            self._generate_phase7_obstacles(initial_pos, path_vector)
+            return
+
         # ==========================================
-        # 🎯 障碍物 1：主线拦路虎 (逼迫微操)
+        # default: 主线拦路虎 (Phase 5/6 沿用)
         # ==========================================
-        # 放在路程的中段 (40% ~ 60%)
-        k1 = np.random.uniform(0.4, 0.6)
+        k1 = np.random.uniform(0.2, 0.8)
         base_pos_1 = initial_pos + path_vector * k1
-        
-        # 极限收紧偏移量，确保它严丝合缝地挡在直线上
         jitter_1 = np.array([
-            np.random.uniform(-0.5, 0.5), 
-            np.random.uniform(-0.5, 0.5), 
-            np.random.uniform(-0.5, 0.5)  
+            np.random.uniform(-0.6, 0.6),
+            np.random.uniform(-0.6, 0.6),
+            np.random.uniform(-0.6, 0.6)
         ])
         pos1 = base_pos_1 + jitter_1
         pos1[2] = np.clip(pos1[2], self.water_bottom_z + 2, self.water_surface_z - 2)
-        
         vel1 = np.zeros(3) if getattr(self, 'is_static_obs', False) else np.random.uniform(-1.0, 1.0, 3)
-        radius1 = np.random.uniform(0.3, 0.5) # 稍微放大一点点主障碍物
+        radius1 = np.random.uniform(0.3, 0.5)
         self.dynamic_obs.append({'pos': pos1, 'vel': vel1, 'radius': radius1})
 
-        # ==========================================
-        # 🚧 障碍物 2 & 3：两翼封锁 (防止绕大路)
-        # ==========================================
-        for _ in range(self.num_dynamic_obs - 1):
-            # 随机散布在整条航线的纵深上
-            k_far = np.random.uniform(0.2, 0.8)
-            base_pos_far = initial_pos + path_vector * k_far
-            
-            # 强制产生巨大的横向偏移，彻底远离中心线
-            # 使用 random.choice 决定是往左偏还是往右偏
-            sign_x = np.random.choice([-1, 1])
-            sign_y = np.random.choice([-1, 1])
-            
-            jitter_far = np.array([
-                sign_x * np.random.uniform(1.5, 2.5), # 偏离航线 4 到 8 米
-                sign_y * np.random.uniform(1.5, 2.5), # 偏离航线 4 到 8 米
-                np.random.uniform(-3.0, 3.0)          # 高度稍微错开
+    def _generate_phase7_obstacles(self, initial_pos, path_vector):
+        path_length = np.linalg.norm(path_vector)
+        if path_length < 0.1:
+            return
+        path_dir = path_vector / path_length
+        perp_left = np.array([-path_dir[1], path_dir[0], 0.0])
+        perp_right = np.array([path_dir[1], -path_dir[0], 0.0])
+
+        # === 主线障碍物：3-5 个，沿航线均匀散布 ===
+        num_main = np.random.randint(3, 6)
+        for _ in range(num_main):
+            k = np.random.uniform(0.1, 0.9)
+            base = initial_pos + path_vector * k
+            jitter = np.array([
+                np.random.uniform(-0.8, 0.8),
+                np.random.uniform(-0.8, 0.8),
+                np.random.uniform(-0.6, 0.6)
             ])
-            pos_far = base_pos_far + jitter_far
-            
-            # 兜底：防止刷出水面或海底
-            pos_far[2] = np.clip(pos_far[2], self.water_bottom_z + 2, self.water_surface_z - 2)
-            
-            vel_far = np.zeros(3) if getattr(self, 'is_static_obs', False) else np.random.uniform(-1.0, 1.0, 3)
-            radius_far = np.random.uniform(0.2, 0.4)
-            self.dynamic_obs.append({'pos': pos_far, 'vel': vel_far, 'radius': radius_far})
+            pos = base + jitter
+            pos[2] = np.clip(pos[2], self.water_bottom_z + 2, self.water_surface_z - 2)
+            radius = np.random.uniform(0.3, 0.5)
+            self.dynamic_obs.append({'pos': pos, 'vel': np.zeros(3), 'radius': radius})
+
+        # === 侧翼大型障碍物：2-4 个，偏离航线 2-3m，半径 0.8-1.5m ===
+        num_flank = np.random.randint(2, 5)
+        for _ in range(num_flank):
+            k = np.random.uniform(0.15, 0.85)
+            base = initial_pos + path_vector * k
+            side = perp_left if np.random.random() < 0.5 else perp_right
+            offset = np.random.uniform(2.0, 3.0)
+            pos = base + side * offset
+            pos += path_dir * np.random.uniform(-0.5, 0.5)
+            pos[2] = np.clip(pos[2] + np.random.uniform(-1.0, 1.0),
+                             self.water_bottom_z + 2, self.water_surface_z - 2)
+            radius = np.random.uniform(0.8, 1.5)
+            self.dynamic_obs.append({'pos': pos, 'vel': np.zeros(3), 'radius': radius})
 
 
     def _update_dynamic_obstacles(self):
@@ -412,39 +421,24 @@ class ROVP2PDynamicWrapper(gym.Env):
         # - 速度 <= 0.1 m/s：乘数为 0 (彻底掐断低速摸鱼赚姿态分的可能)
         # - 速度 >= 1.0 m/s：乘数为 1.0 (全速巡航，拿满所有绩效)
         # - 速度在 0.1 ~ 1.0 之间：平滑线性增长
-        moving_multiplier = np.clip((closing_speed - 0.1) / (1.0 - 0.1), 0.0, 1.0)
+        moving_multiplier = np.clip((closing_speed - 0.1) / (1.0 - 0.1), 0.1, 1.0)
+        # 2. 声呐障碍物软惩罚
+        ## 替换原来的软惩罚
+        # 🌟 柔化声呐惩罚
+        safe_dist = 3.0  # 安全距离阈值，3米内开始逐渐增加惩罚
+        # 1. 统一危险系数 (0.0 -> 1.0 绝对线性映射)
+        danger_ratio = np.clip((safe_dist - min_sonar_dist) / safe_dist, 0.0, 1.0)
 
-        # ========================================
-        # 🌟 新增：速度-目标指向一致性奖励 (铁腕防绕路)
-        # ========================================
-        v_world = np.array(self.current_obs_dict["VelocitySensor"])
-        speed_world = np.linalg.norm(v_world)
-        vec_to_target = self.target_pos - current_pos
+        # 2. 距离排斥力：三次幂曲线 (Cubic Repulsion)
+        reward -= 8.0 * (danger_ratio ** 3)
         
-        # 只有在产生有效物理速度时才进行判定，避免原地打转时的分母为 0 或误判
-        if speed_world > 0.1 and distance_to_target > 0.1:
-            # 向量点乘公式计算 cos(theta)
-            raw_cos = np.dot(v_world, vec_to_target) / (speed_world * distance_to_target)
-            cos_theta = np.clip(raw_cos, -1.0, 1.0)
-            
-            # 🌟 核心调整：将临界角收紧至 30 度 (cos(30°) ≈ 0.866)
-            critical_cos = 0.866 
-            
-            if cos_theta > critical_cos:
-                # 合法微操或直行：角度越小 (cos越接近1)，奖励越高
-                alignment_bonus = (cos_theta - critical_cos) / (1.0 - critical_cos)
-                reward += alignment_bonus * 2.5 * moving_multiplier
-            else:
-                # 判定为绕远路：偏离超过 30 度，采用二次方惩罚
-                detour_penalty = ((critical_cos - cos_theta) ** 2) * 10.0
-                reward -= detour_penalty * moving_multiplier
-
+        attention_weight = 1.0 - danger_ratio
         
-        ## 2. 🌟 铁腕航向对齐 (防挂机版)
+        ## 3. 🌟 铁腕航向对齐 (防挂机版)
         yaw_error_deg_abs = abs(np.rad2deg(yaw_error))
         
         # 钟形曲线：0度=1.0分, 20度≈0.36分, 40度≈0.01分
-        yaw_bonus = np.exp(- (yaw_error_deg_abs**2) / 2000.0)
+        yaw_bonus = np.exp(- (yaw_error_deg_abs**2) / 2000.0)* attention_weight
         reward += yaw_bonus  * moving_multiplier  # 只有在有效前进时才奖励航向对齐
             
         yaw_change = abs(yaw_new - self.previous_yaw)
@@ -454,37 +448,67 @@ class ROVP2PDynamicWrapper(gym.Env):
 
         self.previous_yaw = yaw_new
         
-        ## 3. ⚖️ 高斯姿态奖励 (取消线性扣分)
+        ## 4. ⚖️ 高斯姿态奖励 (取消线性扣分)
         tilt = np.sqrt(roll_new**2 + pitch_new**2)
         tilt_deg = np.rad2deg(tilt)
 
         # 钟形曲线：0度=1.0分, 15度≈0.47分, 30度≈0.05分
         # 修复：只在有效前进时才给姿态奖励
-        attitude_bonus = np.exp(-(tilt_deg**2) / 300.0)
+        attitude_bonus = np.exp(-(tilt_deg**2) / 300.0)* attention_weight
         reward += attitude_bonus * moving_multiplier
                     
         # 危险倾角底线惩罚 (防止彻底翻车)
         # 🌟 修复：长途续航版 晚熟指数障碍惩罚 (Late-Blooming Exponential Barrier)
         # 40度时惩罚仅为 0.088，完美适应长步数累积；55度后爆发至 35+ 防止侧翻
         raw_barrier = 1e-8 * (np.exp(0.4 * tilt_deg) - 1.0)
-        barrier_penalty = np.clip(raw_barrier, 0.0, 100.0)
+        barrier_penalty = np.clip(raw_barrier, 0.0, 100.0)* attention_weight
         reward -= barrier_penalty
 
         
-        ## 4. 🌟 释放性能封印 (极低的动力惩罚，鼓励敢于满功率抗流)
+        ## 5. 🌟 释放性能封印 (极低的动力惩罚，鼓励敢于满功率抗流)
         reward -= np.sum(np.square(action - self.previous_action)) * 0.04
         self.previous_action = np.copy(action)
         
-        ## 5. 声呐障碍物软惩罚
-        ## 替换原来的软惩罚
-        # 🌟 柔化声呐惩罚
-        safe_dist = 3.0  # 安全距离阈值，3米内开始逐渐增加惩罚
-        # 1. 统一危险系数 (0.0 -> 1.0 绝对线性映射)
-        danger_ratio = np.clip((safe_dist - min_sonar_dist) / safe_dist, 0.0, 1.0)
+        # ## 5. 声呐障碍物软惩罚
+        # ## 替换原来的软惩罚
+        # # 🌟 柔化声呐惩罚
+        # safe_dist = 3.0  # 安全距离阈值，3米内开始逐渐增加惩罚
+        # # 1. 统一危险系数 (0.0 -> 1.0 绝对线性映射)
+        # danger_ratio = np.clip((safe_dist - min_sonar_dist) / safe_dist, 0.0, 1.0)
 
-        # 2. 距离排斥力：三次幂曲线 (Cubic Repulsion)
-        reward -= 8.0 * (danger_ratio ** 3)
+        # # 2. 距离排斥力：三次幂曲线 (Cubic Repulsion)
+        # reward -= 8.0 * (danger_ratio ** 3)
 
+        # ========================================
+        # 🌟 新增：速度-目标指向一致性奖励 (铁腕防绕路)
+        # ========================================
+        grace_period = 45 
+        # 豁免期内，即使没有有效靠近速度，也默认给予 1.0 的乘数，鼓励原地打转对齐
+        effective_multiplier = 1.0 if self.current_step <= grace_period else moving_multiplier
+        v_world = np.array(self.current_obs_dict["VelocitySensor"])
+        speed_world = np.linalg.norm(v_world)
+        vec_to_target = self.target_pos - current_pos
+   
+        # 只有在产生有效物理速度时才进行判定，避免原地打转时的分母为 0 或误判
+        if speed_world > 0.1 and distance_to_target > 0.1:
+            raw_cos = np.dot(v_world, vec_to_target) / (speed_world * distance_to_target)
+            cos_theta = np.clip(raw_cos, -1.0, 1.0)
+            critical_cos = 0.866 
+            
+            # 🔥 无论何时，都引入 (1 - danger_ratio) 的动态权重！
+            # 距离鱼越近，对准目标的强制要求就越弱，为避障让出决策空间。
+            # attention_weight = 1.0 - danger_ratio 
+            
+            if cos_theta > critical_cos:
+                # 依然是合法微操，但面临危险时，对齐目标的奖励也会略微减弱，鼓励它专心躲避
+                alignment_bonus = (cos_theta - critical_cos) / (1.0 - critical_cos) * attention_weight
+                reward += alignment_bonus * 2.5 * effective_multiplier 
+            else:
+                if self.current_step > grace_period:
+                    # 危急时刻，绕路惩罚无限趋近于 0，特批紧急避险！
+                    detour_penalty = ((critical_cos - cos_theta) ** 2) * 10.0 * attention_weight
+                    reward -= detour_penalty * moving_multiplier 
+        
         # 3. 🛡️ 动态限速 (加上了你完美的安全锁)
         if min_sonar_dist < safe_dist:
             # 安全速度限额随距离线性递减 (4m外限速1.4m/s，贴脸限速无限趋近0m/s)
