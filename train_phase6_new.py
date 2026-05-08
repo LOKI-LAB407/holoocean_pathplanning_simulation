@@ -4,7 +4,7 @@ from callback import RollingCheckpointCallback
 from rov_env_new import ROVP2PDynamicWrapper, rov_config
 
 
-def run_training(total_timesteps=200000, model_path=None, buffer_path=None):
+def run_training(total_timesteps=400000, model_path=None, buffer_path=None):
     print("🌟 正在初始化 [Phase 6: 避障训练] 训练环境...")
 
     phase6_curriculum = {

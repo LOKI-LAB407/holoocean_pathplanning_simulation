@@ -117,11 +117,12 @@ class ROVP2PDynamicWrapper(gym.Env):
         self.is_static_obs = curriculum_config.get("is_static_obs", False)
         self.amplitude = curriculum_config.get("amplitude", 0.0)
         self.obstacle_layout = curriculum_config.get("obstacle_layout", "default")
+        self.show_viewport = curriculum_config.get("show_viewport", False)
 
         # self.holo_env = holoocean.make(scenario_cfg=config, show_viewport=False)
         self.holo_env = holoocean.make(
-            scenario_cfg=config, 
-            show_viewport=False 
+            scenario_cfg=config,
+            show_viewport=self.show_viewport
         )
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(25,), dtype=np.float32)
@@ -176,6 +177,9 @@ class ROVP2PDynamicWrapper(gym.Env):
         if self.obstacle_layout == "phase7":
             self._generate_phase7_obstacles(initial_pos, path_vector)
             return
+        if self.obstacle_layout == "phase8":
+            self._generate_phase8_obstacles(initial_pos, path_vector)
+            return
 
         # ==========================================
         # default: 主线拦路虎 (Phase 5/6 沿用)
@@ -183,85 +187,222 @@ class ROVP2PDynamicWrapper(gym.Env):
         k1 = np.random.uniform(0.2, 0.8)
         base_pos_1 = initial_pos + path_vector * k1
         jitter_1 = np.array([
-            np.random.uniform(-0.6, 0.6),
-            np.random.uniform(-0.6, 0.6),
-            np.random.uniform(-0.6, 0.6)
+            np.random.uniform(-0.2, 0.2),
+            np.random.uniform(-0.2, 0.2),
+            np.random.uniform(-0.2, 0.2)
         ])
         pos1 = base_pos_1 + jitter_1
         pos1[2] = np.clip(pos1[2], self.water_bottom_z + 2, self.water_surface_z - 2)
         vel1 = np.zeros(3) if getattr(self, 'is_static_obs', False) else np.random.uniform(-1.0, 1.0, 3)
-        radius1 = np.random.uniform(0.3, 0.5)
-        self.dynamic_obs.append({'pos': pos1, 'vel': vel1, 'radius': radius1})
+        radius1 = np.random.uniform(0.1, 0.25)
+        obs = {'pos': pos1, 'vel': vel1, 'radius': radius1}
+        if not getattr(self, 'is_static_obs', False):
+            self._init_fish_state(obs)
+        self.dynamic_obs.append(obs)
 
     def _generate_phase7_obstacles(self, initial_pos, path_vector):
+        """Phase 7: 泛化避障 — 3-6 条静态小鱼沿航线散布，无大型障碍。"""
         path_length = np.linalg.norm(path_vector)
         if path_length < 0.1:
             return
-        path_dir = path_vector / path_length
-        perp_left = np.array([-path_dir[1], path_dir[0], 0.0])
-        perp_right = np.array([path_dir[1], -path_dir[0], 0.0])
 
-        # === 主线障碍物：3-5 个，沿航线均匀散布 ===
-        num_main = np.random.randint(3, 6)
+        # === 漂移小鱼：2-3 个，半径 0.1-0.25m，微速漂移 ===
+        num_main = np.random.randint(2, 4)
         for _ in range(num_main):
-            k = np.random.uniform(0.1, 0.9)
+            k = np.random.uniform(0.2, 0.8)
             base = initial_pos + path_vector * k
             jitter = np.array([
-                np.random.uniform(-0.8, 0.8),
-                np.random.uniform(-0.8, 0.8),
-                np.random.uniform(-0.6, 0.6)
+                np.random.uniform(-0.5, 0.5),
+                np.random.uniform(-0.5, 0.5),
+                np.random.uniform(-0.5, 0.5)
             ])
             pos = base + jitter
             pos[2] = np.clip(pos[2], self.water_bottom_z + 2, self.water_surface_z - 2)
-            radius = np.random.uniform(0.3, 0.5)
-            self.dynamic_obs.append({'pos': pos, 'vel': np.zeros(3), 'radius': radius})
+            radius = np.random.uniform(0.1, 0.25)
+            vel = np.array([
+                np.random.uniform(-0.1, 0.1),
+                np.random.uniform(-0.1, 0.1),
+                np.random.uniform(-0.05, 0.05)
+            ])
+            obs = {'pos': pos, 'vel': vel, 'radius': radius,
+                   'fish_state': 'drift'}
+            self.dynamic_obs.append(obs)
 
-        # === 侧翼大型障碍物：2-4 个，偏离航线 2-3m，半径 0.8-1.5m ===
-        num_flank = np.random.randint(2, 5)
-        for _ in range(num_flank):
-            k = np.random.uniform(0.15, 0.85)
+    def _generate_phase8_obstacles(self, initial_pos, path_vector):
+        """Phase 8: 动态小鱼避障 — 3-6 条动态小鱼，无大型障碍。"""
+        path_length = np.linalg.norm(path_vector)
+        if path_length < 0.1:
+            return
+
+        # === 主线动态小鱼：2-3 个 (平均每 10m 一个)，半径 0.1-0.25m ===
+        num_main = np.random.randint(2, 4)
+        for _ in range(num_main):
+            k = np.random.uniform(0.2, 0.8)
             base = initial_pos + path_vector * k
-            side = perp_left if np.random.random() < 0.5 else perp_right
-            offset = np.random.uniform(2.0, 3.0)
-            pos = base + side * offset
-            pos += path_dir * np.random.uniform(-0.5, 0.5)
-            pos[2] = np.clip(pos[2] + np.random.uniform(-1.0, 1.0),
-                             self.water_bottom_z + 2, self.water_surface_z - 2)
-            radius = np.random.uniform(0.8, 1.5)
-            self.dynamic_obs.append({'pos': pos, 'vel': np.zeros(3), 'radius': radius})
+            jitter = np.array([
+                np.random.uniform(-0.5, 0.5),
+                np.random.uniform(-0.5, 0.5),
+                np.random.uniform(-0.5, 0.5)
+            ])
+            pos = base + jitter
+            pos[2] = np.clip(pos[2], self.water_bottom_z + 2, self.water_surface_z - 2)
+            radius = np.random.uniform(0.1, 0.25)
+            obs = {'pos': pos, 'vel': np.random.uniform(-0.2, 0.2, 3), 'radius': radius,
+                   'is_static': False}
+            self._init_fish_state(obs)
+            self.dynamic_obs.append(obs)
 
+
+    def _init_fish_state(self, obs):
+        obs['fish_state'] = 'cruise'
+        obs['state_timer'] = np.random.uniform(0, 5)
+        obs['cruise_speed'] = np.random.uniform(0.08, 0.3)
+        obs['cruise_target'] = obs['pos'].copy()
+        obs['escape_dir'] = np.zeros(3)
+        obs['escape_phase'] = 0
 
     def _update_dynamic_obstacles(self):
-        # 🌟 如果是静态障碍物，直接短路返回，不进行任何位置更新
         if getattr(self, 'is_static_obs', False):
             return
 
-        dt = 1.0 / 30.0 
-        current_rov_pos = np.array(self.current_obs_dict["LocationSensor"])
-  
+        dt = 1.0 / 30.0
+        rov_pos = np.array(self.current_obs_dict["LocationSensor"])
+
+        # 行为参数
+        alert_start = 10.0     # 开始警觉
+        alert_full = 4.0       # 完全警觉，准备逃逸
+        escape_trigger = 2.0   # C-start 爆发
+        escape_peak_speed = 0.5 # 低于 ROV 最大速度 1.4m/s，让 ROV 有机会碰到鱼
+        recover_safe_dist = 8.0
+
         for obs in self.dynamic_obs:
-           # 🌟 鱼群避让逻辑：如果离 ROV 小于 3 米，鱼会向反方向加速逃逸
-            dist_to_rov = np.linalg.norm(obs['pos'] - current_rov_pos)
-            if dist_to_rov < 3.0:
-                escape_vec = obs['pos'] - current_rov_pos
-                escape_vec[2] *= 0.1 # 避免鱼飞出水面
-                # 🌟 修复：加入极小值保护，防止除以零引发 NaN 病毒
-                norm = np.linalg.norm(escape_vec)
-                if norm > 1e-4:
-                    escape_dir = escape_vec / norm
-                    obs['vel'] = escape_dir * 1.0
+            if obs.get('is_static', False):
+                continue
+            if 'fish_state' not in obs:
+                self._init_fish_state(obs)
 
-            obs['pos'] += obs['vel'] * dt 
-            # ========== 替换原有的 for axis in range(3) 逻辑 ==========
-            # 1. 处理 X, Y 轴水平边界
-            for axis in range(2): 
+            # === 漂移态 (Phase 7: 微速被动移动，无鱼类AI，无需 state_timer) ===
+            if obs['fish_state'] == 'drift':
+                obs['pos'] += obs['vel'] * dt
+                for axis in range(2):
+                    if obs['pos'][axis] > 30.0:
+                        obs['vel'][axis] = -abs(obs['vel'][axis])
+                    elif obs['pos'][axis] < -30.0:
+                        obs['vel'][axis] = abs(obs['vel'][axis])
+                if obs['pos'][2] > self.water_surface_z - 1.0:
+                    obs['vel'][2] = -abs(obs['vel'][2])
+                elif obs['pos'][2] < self.water_bottom_z + 1.0:
+                    obs['vel'][2] = abs(obs['vel'][2])
+                continue
+
+            dist = np.linalg.norm(obs['pos'] - rov_pos)
+            obs['state_timer'] += dt
+
+            # === 巡航态 ===
+            if obs['fish_state'] == 'cruise':
+                if dist < alert_start:
+                    obs['fish_state'] = 'alert'
+                    obs['state_timer'] = 0.0
+                else:
+                    # 向巡航目标慢速游动
+                    to_target = obs['cruise_target'] - obs['pos']
+                    if np.linalg.norm(to_target) < 0.3 or obs['state_timer'] > 8.0:
+                        # 到达或超时，换新目标
+                        obs['cruise_target'] = obs['pos'] + np.array([
+                            np.random.uniform(-5, 5),
+                            np.random.uniform(-5, 5),
+                            np.random.uniform(-3, 3)
+                        ])
+                        obs['cruise_target'][2] = np.clip(
+                            obs['cruise_target'][2],
+                            self.water_bottom_z + 2, self.water_surface_z - 2)
+                        obs['state_timer'] = 0.0
+                    dir_to_target = to_target / (np.linalg.norm(to_target) + 1e-6)
+                    obs['vel'] = dir_to_target * obs['cruise_speed']
+
+            # === 警觉态 ===
+            elif obs['fish_state'] == 'alert':
+                alertness = np.clip((alert_start - dist) / (alert_start - alert_full), 0.0, 1.0)
+                # 逐渐转头远离 ROV，速度微升
+                away = obs['pos'] - rov_pos
+                away[2] *= 0.3
+                away_norm = np.linalg.norm(away)
+                if away_norm > 1e-6:
+                    away_dir = away / away_norm
+                else:
+                    away_dir = np.array([np.random.uniform(-1, 1), np.random.uniform(-1, 1), 0])
+                # 巡航方向 + 远离方向 混合，警觉度越高越偏远离
+                to_target = obs['cruise_target'] - obs['pos']
+                cruise_dir = to_target / (np.linalg.norm(to_target) + 1e-6)
+                blended = cruise_dir * (1 - alertness) + away_dir * alertness
+                blended = blended / (np.linalg.norm(blended) + 1e-6)
+                alert_speed = obs['cruise_speed'] + alertness * 0.3
+                obs['vel'] = blended * alert_speed
+
+                if dist > alert_start + 2.0:
+                    obs['fish_state'] = 'cruise'
+                    obs['state_timer'] = 0.0
+                elif dist < escape_trigger:
+                    # 触发 C-start: 先急转再加速
+                    obs['fish_state'] = 'escape'
+                    obs['state_timer'] = 0.0
+                    obs['escape_phase'] = 0
+                    # 逃逸方向: 远离 + 侧向偏移 (C-turn)
+                    lateral = np.array([-away_dir[1], away_dir[0], 0.0])
+                    lateral_sign = 1.0 if np.random.random() < 0.5 else -1.0
+                    obs['escape_dir'] = away_dir + lateral * lateral_sign * 0.5
+                    obs['escape_dir'] = obs['escape_dir'] / (np.linalg.norm(obs['escape_dir']) + 1e-6)
+                    obs['vel'] *= 0.1  # 急停准备转向
+
+            # === 逃逸态 ===
+            elif obs['fish_state'] == 'escape':
+                elapsed = obs['state_timer']
+                # C-turn(0-0.15s) → 加速(0.15-0.4s) → 冲刺(0.4-1.5s) → 减速(1.5-2.5s)
+                if elapsed < 0.15:
+                    # C-turn: 快转到逃逸方向，维持低速
+                    obs['vel'] = obs['escape_dir'] * 0.15
+                elif elapsed < 0.45:
+                    # 加速段: 0.15 → escape_peak_speed
+                    ramp = (elapsed - 0.15) / 0.3
+                    speed = 0.15 + ramp * (escape_peak_speed - 0.15)
+                    obs['vel'] = obs['escape_dir'] * speed
+                elif elapsed < 1.5:
+                    # 冲刺段: 保持峰值，微扰防止轨迹太直
+                    jitter = np.array([
+                        np.random.uniform(-0.1, 0.1),
+                        np.random.uniform(-0.1, 0.1),
+                        0.0
+                    ])
+                    obs['vel'] = obs['escape_dir'] * escape_peak_speed + jitter
+                elif elapsed < 3.0:
+                    # 减速段: escape_peak → 巡航速度
+                    decel_ramp = (elapsed - 1.5) / 1.5
+                    speed = escape_peak_speed * (1 - decel_ramp) + obs['cruise_speed'] * decel_ramp
+                    obs['vel'] = obs['escape_dir'] * speed
+                else:
+                    # 恢复巡航
+                    obs['fish_state'] = 'cruise'
+                    obs['state_timer'] = 0.0
+                    obs['cruise_target'] = obs['pos'] + obs['escape_dir'] * np.random.uniform(2, 5)
+                    obs['vel'] = obs['escape_dir'] * obs['cruise_speed']
+
+                # 逃逸中如果离 ROV 够远，提前退出
+                if dist > recover_safe_dist and elapsed > 1.2:
+                    obs['fish_state'] = 'cruise'
+                    obs['state_timer'] = 0.0
+                    obs['cruise_target'] = obs['pos'] + obs['escape_dir'] * np.random.uniform(2, 5)
+                    obs['vel'] = obs['escape_dir'] * obs['cruise_speed']
+
+            # === 位置更新 + 边界反弹 ===
+            obs['pos'] += obs['vel'] * dt
+
+            for axis in range(2):
                 if obs['pos'][axis] > 30.0:
-                    obs['vel'][axis] = -abs(obs['vel'][axis]) 
+                    obs['vel'][axis] = -abs(obs['vel'][axis])
                 elif obs['pos'][axis] < -30.0:
-                    obs['vel'][axis] = abs(obs['vel'][axis])  
+                    obs['vel'][axis] = abs(obs['vel'][axis])
 
-            # 2. 单独处理 Z 轴垂直边界 (防止鱼飞出水面或钻入地底)
-            if obs['pos'][2] > self.water_surface_z - 1.0: # 离水面还有1米时就反弹
+            if obs['pos'][2] > self.water_surface_z - 1.0:
                 obs['vel'][2] = -abs(obs['vel'][2])
             elif obs['pos'][2] < self.water_bottom_z + 1.0:
                 obs['vel'][2] = abs(obs['vel'][2])
@@ -425,7 +566,7 @@ class ROVP2PDynamicWrapper(gym.Env):
         # 2. 声呐障碍物软惩罚
         ## 替换原来的软惩罚
         # 🌟 柔化声呐惩罚
-        safe_dist = 3.0  # 安全距离阈值，3米内开始逐渐增加惩罚
+        safe_dist = 4.0  # 安全距离阈值，4米内开始逐渐增加惩罚
         # 1. 统一危险系数 (0.0 -> 1.0 绝对线性映射)
         danger_ratio = np.clip((safe_dist - min_sonar_dist) / safe_dist, 0.0, 1.0)
 
@@ -437,8 +578,8 @@ class ROVP2PDynamicWrapper(gym.Env):
         ## 3. 🌟 铁腕航向对齐 (防挂机版)
         yaw_error_deg_abs = abs(np.rad2deg(yaw_error))
         
-        # 钟形曲线：0度=1.0分, 20度≈0.36分, 40度≈0.01分
-        yaw_bonus = np.exp(- (yaw_error_deg_abs**2) / 2000.0)* attention_weight
+        # 钟形曲线：0度=1.5分, 20度≈0.36分, 40度≈0.01分
+        yaw_bonus = 1.5*np.exp(- (yaw_error_deg_abs**2) / 500.0)* attention_weight
         reward += yaw_bonus  * moving_multiplier  # 只有在有效前进时才奖励航向对齐
             
         yaw_change = abs(yaw_new - self.previous_yaw)
@@ -493,7 +634,7 @@ class ROVP2PDynamicWrapper(gym.Env):
         if speed_world > 0.1 and distance_to_target > 0.1:
             raw_cos = np.dot(v_world, vec_to_target) / (speed_world * distance_to_target)
             cos_theta = np.clip(raw_cos, -1.0, 1.0)
-            critical_cos = 0.866 
+            critical_cos = 0.985  # cos(10°)，速度方向偏离目标超过 10° 即触发惩罚
             
             # 🔥 无论何时，都引入 (1 - danger_ratio) 的动态权重！
             # 距离鱼越近，对准目标的强制要求就越弱，为避障让出决策空间。

@@ -4,16 +4,16 @@ from callback import RollingCheckpointCallback
 from rov_env_new import ROVP2PDynamicWrapper, rov_config
 
 
-def run_training(total_timesteps=2000000, model_path=None, buffer_path=None):
+def run_training(total_timesteps=700000, model_path=None, buffer_path=None):
     print("🌟 正在初始化 [Phase 7: 泛化避障] 训练环境...")
 
     phase7_curriculum = {
-        "target_dist_range": (12.0, 18.0),
+        "target_dist_range": (20.0, 25.0),
         "dz_range": (-10.0, -2.0),
         "num_vortices": 3,
         "max_current": 0.5,
-        "num_dynamic_obs": 1,        # >0 触发障碍物生成，实际数量由 phase7 layout 决定
-        "is_static_obs": True,
+        "num_dynamic_obs": 1,
+        "is_static_obs": False,     # 让漂移小鱼动起来
         "amplitude": 0.1,
         "obstacle_layout": "phase7"
     }
@@ -21,15 +21,15 @@ def run_training(total_timesteps=2000000, model_path=None, buffer_path=None):
     env = ROVP2PDynamicWrapper(rov_config, curriculum_config=phase7_curriculum)
 
     custom_objects = {
-        "learning_rate": 5e-5,
+        "learning_rate": 8e-5,
         "batch_size": 1024,
         "buffer_size": 500000
     }
 
     if model_path is None:
-        model_path = "sac_rov_edge8_phase6_ready.zip"
-    # if buffer_path is None:
-    #     buffer_path = "./rov_models/sac_rov_phase6_replay_buffer.pkl"
+        model_path = "./rov_models/sac_rov_edge8_phase7_generalize_4025000_steps.zip"
+    if buffer_path is None:
+        buffer_path = "./rov_models/sac_rov_edge8_phase7_generalize_replay_buffer_4025000_steps.pkl"
 
     print("🧠 正在加载 Phase 6 模型，启动泛化避障训练...")
     model = SAC.load(
@@ -39,8 +39,8 @@ def run_training(total_timesteps=2000000, model_path=None, buffer_path=None):
         tensorboard_log="./rov_tensorboard/"
     )
 
-    # print(f"📦 正在导入断点经验包: {buffer_path} ...")
-    # model.load_replay_buffer(buffer_path)
+    print(f"📦 正在导入断点经验包: {buffer_path} ...")
+    model.load_replay_buffer(buffer_path)
 
     checkpoint_callback = RollingCheckpointCallback(
         save_freq=50000,
@@ -54,8 +54,7 @@ def run_training(total_timesteps=2000000, model_path=None, buffer_path=None):
     print(f"🔥 开启 Phase 7 泛化避障训练 ({total_timesteps} 步)！")
     print(f"   🗺️  距离: {phase7_curriculum['target_dist_range']}m")
     print(f"   🌊 洋流: {phase7_curriculum['max_current']} m/s, {phase7_curriculum['num_vortices']} 涡旋")
-    print(f"   🚧 主线障碍: 3-5 个 (r=0.3-0.5m)")
-    print(f"   🏔️  侧翼大型障碍: 2-4 个 (r=0.8-1.5m, 偏移 2-3m)")
+    print(f"   🐟 主线小鱼: 2-3 个 (r=0.1-0.25m, 微速漂移 0-0.1m/s)")
 
     model.learn(
         total_timesteps=total_timesteps,
